@@ -1,0 +1,19 @@
+{
+  "folders": [
+    {
+      "name": "polymarket_okx",
+      "path": "."
+    }
+  ],
+  "settings": {
+    "window.title": "polymarket_okx — ${activeEditorShort}",
+    "files.exclude": {
+      "**/.git": true
+    }
+  },
+  "extensions": {
+    "recommendations": [
+      "ms-python.python"
+    ]
+  }
+}

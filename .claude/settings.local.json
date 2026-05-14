@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/python mvp_runner.py --duration 30 --log /tmp/mvp_test.log)",
+      "Bash(.venv/bin/python mvp_runner.py --duration 600)",
+      "Bash(.venv/bin/python -m py_compile mvp_runner.py)",
+      "Bash(.venv/bin/python mvp_runner.py --duration 60)",
+      "Bash(.venv/bin/python mvp_runner.py --duration 90)",
+      "Bash(.venv/bin/python mvp_runner.py --duration 1800)",
+      "Bash(.venv/bin/python mvp_runner.py --duration 10800)",
+      "Bash(.venv/bin/python -c ' *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(k\\) for k in d.get\\('mcpServers',{}\\).keys\\(\\)]\")",
+      "Skill(update-config)",
+      "Skill(update-config:*)",
+      "Bash(python mvp_runner.py --duration 1800 > mvp_run.log 2>&1)",
+      "Bash(cp /Users/libo/polymarket_okx/MVP_RUN_REPORT.md /Users/libo/polymarket_okx/reports/MVP_RUN_REPORT_round1.md)",
+      "Bash(python mvp_runner.py --duration 1800)",
+      "Bash(python mvp_runner.py --duration 64800)"
+    ],
+    "deny": [
+      "Read(/Users/libo/.hermes/polymarket_arbitrage/**)",
+      "Read(/Users/libo/.hermes/**)",
+      "Read(/Users/libo/.claude/projects/-Users-libo--hermes-polymarket-arbitrage/**)",
+      "Read(/Users/libo/.claude/projects/-Users-libo/**)"
+    ],
+    "additionalDirectories": [
+      "/Users/libo/polymarket_okx"
+    ]
+  }
+}

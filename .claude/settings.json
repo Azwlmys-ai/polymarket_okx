@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -m pytest tests/ --tb=short -q)",
+      "Bash(python3 -m pytest --tb=short -q)",
+      "Bash(python3 -m pytest /Users/libo/polymarket_okx/tests/ --tb=no -q)",
+      "Bash(python3 -m pytest tests/test_paper_trader.py tests/test_evaluator.py -q)",
+      "Bash(python3 -c \"import ast; ast.parse(open('mvp_runner.py').read()); print('syntax OK')\")",
+      "Bash(DISABLE_SSL_VERIFY=1 .venv/bin/python mvp_runner.py --duration 900 --threshold 0.002)",
+      "Bash(DISABLE_SSL_VERIFY=1 .venv/bin/python mvp_runner.py --duration 3600 --threshold 0.0015)",
+      "Bash(DISABLE_SSL_VERIFY=1 .venv/bin/python mvp_runner.py --duration 46800 --threshold 0.0015 --log mvp_run_13h.log --report reports/MVP_RUN_REPORT_13h.md)",
+      "Bash(DISABLE_SSL_VERIFY=1 .venv/bin/python mvp_runner.py --duration 3600 --log /tmp/mvp_*.log --report /tmp/mvp_*.md)",
+      "Read(/tmp/mvp_*)",
+      "Read(/private/tmp/mvp_*)",
+      "Bash(sqlite3 /Users/libo/polymarket_okx/data/research.db *)",
+      "Bash(git *)"
+    ]
+  }
+}

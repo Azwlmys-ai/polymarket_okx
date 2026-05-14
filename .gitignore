@@ -1,0 +1,35 @@
+# ── Python runtime ──────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── Data / databases ────────────────────────────────
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# ── Run artefacts (logs & auto-generated reports) ───
+*.log
+reports/*.md
+MVP_RUN_REPORT*.md
+
+# ── Secrets / env ───────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ── macOS ────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── IDE ──────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

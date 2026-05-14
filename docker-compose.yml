@@ -1,0 +1,16 @@
+services:
+  research:
+    build:
+      context: .
+    command: python -m src.main init-db
+    environment:
+      APP_ENV: local
+      DATABASE_URL: sqlite:///./data/research.db
+      ALLOW_REAL_TRADING: "false"
+      ALLOW_PRIVATE_KEYS: "false"
+      ALLOW_WITHDRAWALS: "false"
+      ALLOW_BROWSER_AUTOMATION: "false"
+    volumes:
+      - .:/app
+    working_dir: /app
+
