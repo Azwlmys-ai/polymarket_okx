@@ -507,21 +507,30 @@ async def poly_discovery_task() -> None:
 
 async def _discover_poly_markets(session: aiohttp.ClientSession) -> None:
     """翻页扫描全部活跃市场，筛选加密相关，按流动性取 top N 写入缓存。"""
-    url = f"{POLY_GAMMA_URL}/markets"
+    # Gamma API migrated to keyset pagination on 2026-05-01.
+    # The old offset endpoint returns HTTP 422 past offset 10000.
+    keyset_url = f"{POLY_GAMMA_URL}/markets/keyset"
     timeout = aiohttp.ClientTimeout(total=20)
     # asset → list of (liquidity, market_id, question)
     candidates: dict[str, list[tuple[float, str, str]]] = {k: [] for k in ASSET_KEYWORDS}
 
-    offset = 0
+    BATCH = 100
+    MAX_PAGES = 200          # hard guard: 200 × 100 = 20,000 markets max
+    next_cursor: str = ""
+    pages = 0
     total_scanned = 0
-    while not state.shutdown.is_set():
-        params = {"limit": 500, "active": "true", "closed": "false", "offset": offset}
-        async with session.get(url, params=params, timeout=timeout) as resp:
+    while not state.shutdown.is_set() and pages < MAX_PAGES:
+        params: dict[str, str] = {"limit": str(BATCH), "active": "true", "closed": "false"}
+        if next_cursor:
+            params["next_cursor"] = next_cursor
+        async with session.get(keyset_url, params=params, timeout=timeout) as resp:
             resp.raise_for_status()
-            items = await resp.json(content_type=None)
+            page_data = await resp.json(content_type=None)
+        items = page_data.get("markets", []) if isinstance(page_data, dict) else page_data
         if not items:
             break
         total_scanned += len(items)
+        pages += 1
 
         now_ts = time.time()
         for m in items:
@@ -571,9 +580,9 @@ async def _discover_poly_markets(session: aiohttp.ClientSession) -> None:
                     candidates[asset].append((score, liq, tier, end_ts, mid, q[:120]))
                     break
 
-        if len(items) < 500:
+        next_cursor = page_data.get("next_cursor", "") if isinstance(page_data, dict) else ""
+        if not next_cursor:
             break
-        offset += 500
 
     # 每资产取 top N（短期优先 + 流动性）
     new_cache: dict[str, tuple[str, float, int, float]] = {}  # market_id → (asset, liq, tier, end_ts)
