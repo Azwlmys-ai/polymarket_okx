@@ -4,14 +4,15 @@ scripts/watch_poly_markets.py
 只读 Polymarket 市场监控脚本。
 
 功能：
-- 扫描 /markets/keyset（去重），检查 BTC/ETH/SOL Up or Down 等短期加密市场
+- 扫描 /markets?order=startDate&ascending=false（最新创建的市场在前）
+- 检查 BTC/ETH/SOL/XRP/DOGE/BNB Up or Down 等短期加密市场
 - 输出扫描报告，若发现可交易目标市场则提示可以启动 14h dry-run
 - 不修改任何交易逻辑，不启动 mvp_runner.py，不接触真实交易
 
 用法：
     python scripts/watch_poly_markets.py          # 单次扫描
     python scripts/watch_poly_markets.py --loop 30  # 每 30 分钟循环扫描
-    python scripts/watch_poly_markets.py --pages 100  # 最多扫描 100 页
+    python scripts/watch_poly_markets.py --pages 30  # 最多扫描 30 页（3000 市场）
 
 禁止真实交易。仅用于研究目的。
 """
@@ -29,8 +30,8 @@ from datetime import datetime, timezone
 # 配置
 # ─────────────────────────────────────────
 GAMMA_URL   = "https://gamma-api.polymarket.com"
-BATCH       = 100       # keyset API 每页上限
-MAX_PAGES   = 300       # 保护上限（300×100=30,000 市场）
+BATCH       = 100       # 每页上限
+MAX_PAGES   = 30        # 保护上限（30×100=3,000 市场，覆盖所有 Up or Down 市场）
 
 MIN_YES     = 0.47      # 与 mvp_runner.py 一致
 MAX_YES     = 0.53
@@ -38,23 +39,24 @@ MAX_DAYS_TO_EXPIRY = 7  # 只考虑 7 天内到期的市场（过滤长期投机
 
 # 目标市场检测规则（短期加密方向市场）
 # 只保留 tier=3/4：分钟级区间和日线方向。
-# tier=2（长期价格触达）已移除——其唯一匹配 "Will bitcoin hit $1m before GTA VI?"
-# 是长期投机市场，YES 价格不跟 OKX 实时信号，历史 14h 已验证无法盈利。
 TARGET_PATTERNS = [
     # tier=4：分钟级区间市场（"7:25AM-7:30AM ET"）
-    (4, re.compile(r"(bitcoin|btc|ethereum|eth|solana|sol).*"
+    (4, re.compile(r"(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb).*"
                    r"(up or down|higher or lower).*"
                    r"\d{1,2}:\d{2}(am|pm).*-.*\d{1,2}:\d{2}(am|pm)", re.I)),
     # tier=3：日线方向市场（"Up or Down" 无时间后缀）
-    (3, re.compile(r"(bitcoin|btc|ethereum|eth|solana|sol).*"
+    (3, re.compile(r"(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb).*"
                    r"(up or down|higher or lower)", re.I)),
 ]
 
-# BTC/ETH/SOL 候选词（不含方向词，用于广义统计）
+# 资产候选词（不含方向词，用于广义统计）
 ASSET_KW = {
-    "BTC": ["bitcoin", " btc "],
-    "ETH": ["ethereum", " eth "],
-    "SOL": ["solana", " sol "],
+    "BTC":  ["bitcoin", " btc "],
+    "ETH":  ["ethereum", " eth "],
+    "SOL":  ["solana", " sol "],
+    "XRP":  ["xrp", "ripple"],
+    "DOGE": ["dogecoin", "doge"],
+    "BNB":  ["bnb"],
 }
 
 
@@ -73,10 +75,12 @@ _CTX = _ssl_ctx()
 _HEADERS = {"User-Agent": "poly-watch/1.0"}
 
 
-def fetch_page(cursor: str = "") -> dict:
-    url = f"{GAMMA_URL}/markets/keyset?limit={BATCH}"
-    if cursor:
-        url += f"&next_cursor={cursor}"
+def fetch_page(offset: int = 0) -> list:
+    """Fetch one page of markets sorted by newest startDate. Returns a list."""
+    url = (
+        f"{GAMMA_URL}/markets"
+        f"?limit={BATCH}&order=startDate&ascending=false&offset={offset}"
+    )
     req = urllib.request.Request(url, headers=_HEADERS)
     with urllib.request.urlopen(req, timeout=15, context=_CTX) as r:
         return json.loads(r.read())
@@ -107,27 +111,27 @@ def tier_of(title: str) -> int:
 # ─────────────────────────────────────────
 def scan_once(max_pages: int = MAX_PAGES) -> dict:
     """
-    Scan Polymarket keyset, deduplicate, classify markets.
+    Scan Polymarket sorted by newest startDate, deduplicate, classify markets.
     Returns a result dict suitable for display.
     """
     seen: set[str] = set()
-    targets: list[dict] = []          # tier >= 2 且 YES 在范围内
+    targets: list[dict] = []          # tier >= 3 且 YES 在范围内
     asset_counts: dict[str, int] = {k: 0 for k in ASSET_KW}
     total_unique = 0
     pages = 0
-    cursor = ""
+    offset = 0
 
     while pages < max_pages:
         try:
-            page = fetch_page(cursor)
+            markets = fetch_page(offset)
         except Exception as exc:
             print(f"  [WARN] fetch failed: {exc}")
             break
 
-        markets = page.get("markets", [])
-        if not markets:
+        if not isinstance(markets, list) or not markets:
             break
         pages += 1
+        offset += BATCH
 
         for m in markets:
             mid = str(m.get("id") or m.get("conditionId") or "")
@@ -169,8 +173,7 @@ def scan_once(max_pages: int = MAX_PAGES) -> dict:
                     "days_left": days_left,
                 })
 
-        cursor = page.get("next_cursor", "")
-        if not cursor:
+        if len(markets) < BATCH:
             break
         time.sleep(0.04)
 

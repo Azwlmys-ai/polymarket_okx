@@ -62,7 +62,8 @@ OKX_WS_URLS = [
     "wss://wsaws.okx.com:8443/ws/v5/public",   # AWS 备用
     "wss://wsap.okx.com:8443/ws/v5/public",    # AP 备用
 ]
-OKX_SYMBOLS         = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+OKX_SYMBOLS         = ["BTC-USDT", "ETH-USDT", "SOL-USDT",
+                       "XRP-USDT", "DOGE-USDT", "BNB-USDT"]
 POLY_GAMMA_URL      = "https://gamma-api.polymarket.com"
 POLY_CLOB_URL       = "https://clob.polymarket.com"
 POLY_POLL_S         = 8.0          # 价格刷新间隔（秒）
@@ -90,9 +91,12 @@ SCAN_TIMEOUT_POLY_S = 15.0         # 单批 Polymarket 价格刷新超时（秒�
 # OKX → Polymarket 资产关键词映射（用于全量扫描时过滤）
 # 使用完整词避免 "hegseth" 匹配 "eth" 等误判
 ASSET_KEYWORDS: dict[str, list[str]] = {
-    "BTC-USDT": ["bitcoin", "btc"],
-    "ETH-USDT": ["ethereum"],
-    "SOL-USDT": ["solana"],
+    "BTC-USDT":  ["bitcoin", "btc"],
+    "ETH-USDT":  ["ethereum"],
+    "SOL-USDT":  ["solana"],
+    "XRP-USDT":  ["xrp", "ripple"],
+    "DOGE-USDT": ["dogecoin", "doge"],
+    "BNB-USDT":  ["bnb"],
 }
 
 # ─────────────────────────────────────────
@@ -507,38 +511,44 @@ async def poly_discovery_task() -> None:
 
 async def _discover_poly_markets(session: aiohttp.ClientSession) -> None:
     """翻页扫描全部活跃市场，筛选加密相关，按流动性取 top N 写入缓存。"""
-    # Gamma API migrated to keyset pagination on 2026-05-01.
-    # The old offset endpoint returns HTTP 422 past offset 10000.
-    keyset_url = f"{POLY_GAMMA_URL}/markets/keyset"
+    # Sort by newest startDate so freshly-created Up or Down markets appear
+    # first. The /markets/keyset endpoint returns only ~100 cached long-term
+    # markets and misses all recently-created short-term markets.
+    url = f"{POLY_GAMMA_URL}/markets"
     timeout = aiohttp.ClientTimeout(total=20)
-    # asset → list of (liquidity, market_id, question)
+    # asset → list of (score, liq, tier, end_ts, market_id, question)
     candidates: dict[str, list[tuple[float, str, str]]] = {k: [] for k in ASSET_KEYWORDS}
 
     BATCH = 100
-    MAX_PAGES = 200          # hard guard: 200 × 100 = 20,000 markets max
-    next_cursor: str = ""
+    MAX_PAGES = 30           # hard guard: 30 × 100 = 3,000 markets max
+    seen_ids: set[str] = set()
+    offset = 0
     pages = 0
     total_scanned = 0
     while not state.shutdown.is_set() and pages < MAX_PAGES:
-        params: dict[str, str] = {"limit": str(BATCH), "active": "true", "closed": "false"}
-        if next_cursor:
-            params["next_cursor"] = next_cursor
-        async with session.get(keyset_url, params=params, timeout=timeout) as resp:
+        params: dict[str, str] = {
+            "limit":     str(BATCH),
+            "order":     "startDate",
+            "ascending": "false",
+            "offset":    str(offset),
+        }
+        async with session.get(url, params=params, timeout=timeout) as resp:
             resp.raise_for_status()
-            page_data = await resp.json(content_type=None)
-        items = page_data.get("markets", []) if isinstance(page_data, dict) else page_data
-        if not items:
+            items = await resp.json(content_type=None)
+        if not isinstance(items, list) or not items:
             break
         total_scanned += len(items)
         pages += 1
+        offset += BATCH
 
         now_ts = time.time()
         for m in items:
             q: str = m.get("question") or m.get("title") or ""
             q_low = q.lower()
             mid = str(m.get("id") or m.get("conditionId") or "")
-            if not mid:
+            if not mid or mid in seen_ids:
                 continue
+            seen_ids.add(mid)
 
             # 解析 endDate → Unix 时间戳（0.0 = 未知）
             end_ts = 0.0
@@ -580,8 +590,7 @@ async def _discover_poly_markets(session: aiohttp.ClientSession) -> None:
                     candidates[asset].append((score, liq, tier, end_ts, mid, q[:120]))
                     break
 
-        next_cursor = page_data.get("next_cursor", "") if isinstance(page_data, dict) else ""
-        if not next_cursor:
+        if len(items) < BATCH:
             break
 
     # 每资产取 top N（短期优先 + 流动性）

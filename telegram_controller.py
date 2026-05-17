@@ -59,7 +59,7 @@ _RUNNER_ARGV: list[str] = [
 
 _MIN_YES = 0.47
 _MAX_YES = 0.53
-_DISC_PAGES = 5          # pages for /markets smoke (5×100 = 500 raw)
+_DISC_PAGES = 15         # pages for /markets smoke (15×100 = 1,500 raw; covers Up or Down region)
 _STOP_WAIT_S = 15        # seconds to wait for graceful exit after SIGTERM
 
 log = logging.getLogger("tg_ctrl")
@@ -143,16 +143,21 @@ def launch_runner() -> int:
 # Polymarket discovery (mirrors watch_poly_markets.py logic, read-only)
 # ─────────────────────────────────────────────────────────────────────────────
 _RE_TIER4 = re.compile(
-    r"(bitcoin|btc|ethereum|eth|solana|sol).*(up or down|higher or lower).*"
+    r"(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb)"
+    r".*(up or down|higher or lower).*"
     r"\d{1,2}:\d{2}(am|pm).*-.*\d{1,2}:\d{2}(am|pm)", re.I,
 )
 _RE_TIER3 = re.compile(
-    r"(bitcoin|btc|ethereum|eth|solana|sol).*(up or down|higher or lower)", re.I,
+    r"(bitcoin|btc|ethereum|eth|solana|sol|xrp|ripple|dogecoin|doge|bnb)"
+    r".*(up or down|higher or lower)", re.I,
 )
 _ASSET_KW: dict[str, list[str]] = {
-    "BTC": ["bitcoin", " btc "],
-    "ETH": ["ethereum", " eth "],
-    "SOL": ["solana", " sol "],
+    "BTC":  ["bitcoin", " btc "],
+    "ETH":  ["ethereum", " eth "],
+    "SOL":  ["solana", " sol "],
+    "XRP":  ["xrp", "ripple"],
+    "DOGE": ["dogecoin", "doge"],
+    "BNB":  ["bnb"],
 }
 
 
@@ -173,7 +178,8 @@ async def run_discovery_smoke(
     pages: int = _DISC_PAGES,
 ) -> dict:
     """
-    Scan *pages* pages of the keyset API (read-only).
+    Scan *pages* pages sorted by newest startDate (read-only).
+    Short-term Up or Down markets appear in the first ~30 pages.
 
     Returns::
 
@@ -190,27 +196,27 @@ async def run_discovery_smoke(
     tier4: list[str] = []
     tier3: list[str] = []
     total = 0
-    cursor = ""
+    offset = 0
     timeout = aiohttp.ClientTimeout(total=15)
 
     for _ in range(pages):
-        url = f"{GAMMA_URL}/markets/keyset?limit=100"
-        if cursor:
-            url += f"&next_cursor={cursor}"
+        url = (
+            f"{GAMMA_URL}/markets"
+            f"?limit=100&order=startDate&ascending=false&offset={offset}"
+        )
         try:
             async with session.get(url, timeout=timeout, ssl=_SSL_CTX) as resp:
                 if resp.status != 200:
                     break
-                page = await resp.json(content_type=None)
+                items = await resp.json(content_type=None)
         except Exception as exc:
             log.warning("[DISC] fetch failed: %s", exc)
             break
 
-        markets = page.get("markets", [])
-        if not markets:
+        if not isinstance(items, list) or not items:
             break
 
-        for m in markets:
+        for m in items:
             mid = str(m.get("id") or "")
             if not mid or mid in seen:
                 continue
@@ -231,8 +237,8 @@ async def run_discovery_smoke(
                 elif _RE_TIER3.search(title):
                     tier3.append(title[:80])
 
-        cursor = page.get("next_cursor", "")
-        if not cursor:
+        offset += 100
+        if len(items) < 100:
             break
 
     return {

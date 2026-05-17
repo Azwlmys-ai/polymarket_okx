@@ -142,10 +142,11 @@ class TestSendSigterm:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestRunDiscoverySmoke:
-    def _make_page(self, markets: list[dict], cursor: str = "") -> dict:
-        return {"markets": markets, "next_cursor": cursor}
+    def _make_page(self, markets: list[dict], cursor: str = "") -> list:
+        # API now returns a plain list (offset-based, not keyset dict)
+        return markets
 
-    def _session_returning(self, pages: list[dict]) -> MagicMock:
+    def _session_returning(self, pages: list[list]) -> MagicMock:
         responses = []
         for page in pages:
             mock_resp = AsyncMock()
