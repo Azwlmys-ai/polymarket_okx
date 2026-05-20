@@ -2,27 +2,62 @@
   "experiments": [
     {
       "experiment": "poly_price_lag",
-      "signal_count": 3,
+      "signal_count": 97,
       "regime_breakdown": {
-        "late": 2,
-        "settlement": 1
+        "settlement": 97
       },
       "vol_breakdown": {
-        "low": 3
+        "low": 97
       },
-      "win_rate": 1.0,
-      "mean_return": 0.0005594045048818249,
-      "median_return": 0.0005594045048818249,
-      "max_drawdown": 0.0,
-      "expectancy": 0.0005594045048818249,
-      "fee_adjusted_pnl": -0.020440595495118178,
-      "top_conditions": [],
+      "win_rate": 0.4044943820224719,
+      "mean_return": -9.250100187079698e-05,
+      "median_return": -7.216364653203768e-05,
+      "max_drawdown": 0.009196811465530684,
+      "expectancy": -9.250100187079698e-05,
+      "fee_adjusted_pnl": -1.8772325891665012,
+      "top_conditions": [
+        {
+          "phase": "settlement",
+          "regime": "low",
+          "count": 89,
+          "win_rate": 0.4044943820224719,
+          "mean_return": -9.250100187079698e-05,
+          "expectancy": -9.250100187079698e-05
+        }
+      ],
+      "worst_conditions": []
+    },
+    {
+      "experiment": "settlement_reversion",
+      "signal_count": 18,
+      "regime_breakdown": {
+        "settlement": 18
+      },
+      "vol_breakdown": {
+        "low": 18
+      },
+      "win_rate": 0.5555555555555556,
+      "mean_return": -0.00010421552072107476,
+      "median_return": 3.288381602833848e-05,
+      "max_drawdown": 0.002408536534960255,
+      "expectancy": -0.00010421552072107472,
+      "fee_adjusted_pnl": -0.37987587937297934,
+      "top_conditions": [
+        {
+          "phase": "settlement",
+          "regime": "low",
+          "count": 18,
+          "win_rate": 0.5555555555555556,
+          "mean_return": -0.00010421552072107476,
+          "expectancy": -0.00010421552072107472
+        }
+      ],
       "worst_conditions": []
     }
   ],
-  "total_signals": 3,
+  "total_signals": 115,
   "news_events": 0,
-  "okx_ticks": 1185,
-  "poly_polls": 98,
+  "okx_ticks": 30355,
+  "poly_polls": 2350,
   "errors": 0
 }
