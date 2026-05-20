@@ -2,8 +2,8 @@
 
 > **STATS_ONLY / PAPER_SIM — No real orders. No capital at risk.**
 
-**Generated:** 2026-05-20T15:50:51Z  
-**Session Duration:** 160s  
+**Generated:** 2026-05-20T17:32:00Z  
+**Session Duration:** 300s  
 **Total Signals:** 0  
 **News Events:** 0  
 
