@@ -232,6 +232,10 @@ def _percentile(sv: list[float], p: float) -> float:
     return sv[lo] + (idx - lo) * (sv[hi] - sv[lo])
 
 
+def _fmt_pct(value: Optional[float]) -> str:
+    return "N/A" if value is None else f"{value:.4%}"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Experiment A: Settlement Reversion
 # ─────────────────────────────────────────────────────────────────────────────
@@ -363,7 +367,7 @@ def detect_poly_price_lag(
         signal_strength=strength,
         trigger_reason=(
             f"poly_price_lag: yes_change={yes_change:.4f} "
-            f"btc_30s_ret={btc_30s_ret:.4% if btc_30s_ret else 'N/A'}"
+            f"btc_30s_ret={_fmt_pct(btc_30s_ret)}"
         ),
         market_phase=classify_market_phase(ttl),
         volatility_regime=classify_volatility_regime(btc_vol),
@@ -544,109 +548,81 @@ async def poly_discovery_task(state: EngineState) -> None:
 async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) -> None:
     url = f"{GAMMA_URL}/markets"
     timeout = aiohttp.ClientTimeout(total=20)
-    from datetime import datetime, timezone
-    import re as _re
 
-    now_utc = datetime.now(timezone.utc)
     new_markets: dict[str, PolyMarketState] = {}
     source_label = "gamma"
 
-    def _ingest_item(m: dict) -> Optional[str]:
+    def _ingest_item(m: dict, default_source: str = "gamma") -> Optional[str]:
         """Parse one market item; return market_id if accepted, else None."""
-        mid = str(m.get("id") or "")
+        if not _is_open_market(m):
+            return None
+        mid = str(m.get("condition_id") or m.get("conditionId") or m.get("id") or "")
         if not mid:
             return None
-        q = (m.get("question") or m.get("title") or "").lower()
-        if "up or down" not in q and "higher or lower" not in q:
+        question = m.get("question") or m.get("title") or ""
+        if not _looks_like_btc_short_term(question, m):
             return None
-        if not _re.search(r"\d{1,2}:\d{2}", q):
+        end_ts = _parse_end_ts(m)
+        if end_ts is None:
             return None
-        ed = m.get("endDate")
-        if not ed:
+        ttl = end_ts - time.time()
+        if ttl <= 0 or ttl > 3600:
             return None
-        try:
-            end_dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-        except Exception:
-            return None
-        liq = float(m.get("liquidity") or 0)
+        liq = _as_float(m.get("liquidityClob") or m.get("liquidity") or 0)
         if liq < MIN_LIQUIDITY:
             return None
-        yes = _parse_yes_price(m)
+        yes, no_price = _parse_market_prices(m)
         if yes is None or not (MIN_PRICE < yes < MAX_PRICE):
             return None
-        asset = None
-        for a, kws in ASSET_KW.items():
-            if any(kw in q for kw in kws):
-                asset = a
-                break
-        if asset is None:
-            return None
-        no_price = _parse_no_price(m)
         if no_price is None:
             no_price = 1.0 - yes
         spread = abs(yes + no_price - 1.0)
-        vol = float(m.get("volume") or 0)
+        vol = _as_float(m.get("volumeClob") or m.get("volume") or 0)
+        token_ids = _extract_clob_token_ids(m)
+        source = "clob" if token_ids else default_source
         new_markets[mid] = PolyMarketState(
             market_id=mid,
-            question=(m.get("question") or "")[:120],
-            asset=asset,
+            question=question[:120],
+            asset="BTC",
             yes_price=yes,
             no_price=no_price,
             spread=spread,
             volume=vol,
             liquidity=liq,
-            end_ts=end_dt.timestamp(),
+            end_ts=end_ts,
+            source=source,
         )
+        if token_ids:
+            state.clob_token_ids[mid] = token_ids
         return mid
 
     # ── Phase 0: CLOB read-only short-term discovery ─────────────────────
-    CLOB_URL = "https://clob.polymarket.com"
     clob_markets: dict[str, dict] = {}
-    now_ts_c0 = time.time()
+    clob_seen = 0
+    clob_active = 0
     try:
+        # Public CLOB markets are paginated and may include old/closed rows,
+        # so all short-term/open filtering stays local and explicit.
         async with session.get(
             f"{CLOB_URL}/markets",
-            params={"active": "true", "closed": "false", "limit": "500"},
+            params={"limit": "1000"},
             timeout=aiohttp.ClientTimeout(total=30),
         ) as resp:
             resp.raise_for_status()
             items = await resp.json(content_type=None)
-        log.info("[CLOB] raw items type=%s count=%s", type(items).__name__, len(items) if isinstance(items, list) else (len(items) if isinstance(items, dict) else "?"))
         if isinstance(items, dict):
             # CLOB may return {"data": [...], ...} or {"markets": [...]}
             items = items.get("data") or items.get("markets") or items.get("results") or []
         if isinstance(items, list):
+            clob_seen = len(items)
             for m in items:
                 if not isinstance(m, dict):
                     continue
-                q = (m.get("question") or "").lower()
-                if "up or down" not in q and "higher or lower" not in q:
-                    continue
-                if not _re.search(r"\d{1,2}:\d{2}", q):
-                    continue
-                # Check asset keywords
-                is_btc = False
-                for kw in ASSET_KW.get("BTC", ["bitcoin", "btc"]):
-                    if kw in q:
-                        is_btc = True
-                        break
-                if not is_btc:
-                    continue
-                # Parse end date
-                ed = m.get("end_date_iso") or m.get("endDate")
-                if not ed:
-                    continue
-                try:
-                    end_dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-                except Exception:
-                    continue
-                ttl = end_dt.timestamp() - now_ts_c0
-                if ttl > 3600:  # CLOB phase: only keep ≤1h markets
-                    continue
-                condition_id = str(m.get("condition_id") or "")
-                if not condition_id:
-                    continue
-                clob_markets[condition_id] = m
+                if _is_open_market(m):
+                    clob_active += 1
+                mid = _ingest_item(m, default_source="clob")
+                if mid:
+                    clob_markets[mid] = m
         if clob_markets:
             source_label = "clob"
     except Exception as exc:
@@ -654,83 +630,21 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
 
     # ── CLOB-DIAG: short-term distribution from CLOB ─────────────────────
     now_ts_cd = time.time()
-    clob_ttls = sorted([
-        datetime.fromisoformat(
-            (m.get("end_date_iso") or m.get("endDate") or "").replace("Z", "+00:00")
-        ).timestamp() - now_ts_cd
-        for m in clob_markets.values()
-    ]) if clob_markets else []
+    clob_ttls = sorted(
+        t for t in (
+            (_parse_end_ts(m) or 0.0) - now_ts_cd for m in clob_markets.values()
+        ) if t > 0
+    )
     clob_short_3600 = sum(1 for t in clob_ttls if t <= 3600)
     clob_short_180 = sum(1 for t in clob_ttls if t <= 180)
     log.info(
-        "[CLOB-DIAG] total=%d btc=%d short_term_3600=%d short_term_180=%d ttl_min=%.0fs",
-        len(clob_markets), len(clob_markets), clob_short_3600, clob_short_180,
-        clob_ttls[0] if clob_ttls else -1,
+        "[CLOB-DIAG] endpoint=%s/markets raw=%d open=%d btc_short=%d "
+        "short_term_3600=%d short_term_180=%d ttl_min=%.0fs",
+        CLOB_URL, clob_seen, clob_active, len(clob_markets),
+        clob_short_3600, clob_short_180, clob_ttls[0] if clob_ttls else -1,
     )
 
-    # ── Ingest CLOB markets into new_markets ──────────────────────────────
-    for _cid, cm in clob_markets.items():
-        q = (cm.get("question") or "").lower()
-        ed = cm.get("end_date_iso") or cm.get("endDate") or ""
-        try:
-            end_dt = datetime.fromisoformat(ed.replace("Z", "+00:00"))
-        except Exception:
-            continue
-        # Parse YES/NO prices from CLOB tokens array
-        yes_price: Optional[float] = None
-        no_price: Optional[float] = None
-        tokens = cm.get("tokens") or []
-        for tok in tokens:
-            outcome = (tok.get("outcome") or "").strip()
-            try:
-                price = float(tok.get("price") or 0)
-            except (TypeError, ValueError):
-                continue
-            if outcome.lower() == "yes":
-                yes_price = price
-            elif outcome.lower() == "no":
-                no_price = price
-        if yes_price is None or not (MIN_PRICE < yes_price < MAX_PRICE):
-            continue
-        if no_price is None:
-            no_price = 1.0 - yes_price
-        spread = abs(yes_price + no_price - 1.0)
-        liq_raw = cm.get("liquidity") or cm.get("volume") or 0
-        try:
-            liq = float(liq_raw)
-        except (TypeError, ValueError):
-            liq = 0.0
-        if liq < MIN_LIQUIDITY:
-            continue
-        mid = _cid
-        new_markets[mid] = PolyMarketState(
-            market_id=mid,
-            question=(cm.get("question") or "")[:120],
-            asset="BTC",
-            yes_price=yes_price,
-            no_price=no_price,
-            spread=spread,
-            volume=float(cm.get("volume") or 0),
-            liquidity=liq,
-            end_ts=end_dt.timestamp(),
-            source="clob",
-        )
-        # Store token_id mapping for CLOB orderbook polling
-        yes_tok_id = None
-        no_tok_id = None
-        for tok in tokens:
-            outcome = (tok.get("outcome") or "").strip()
-            tid = str(tok.get("token_id") or tok.get("id") or "")
-            if outcome.lower() == "yes":
-                yes_tok_id = tid
-            elif outcome.lower() == "no":
-                no_tok_id = tid
-        if yes_tok_id and no_tok_id:
-            state.clob_token_ids[mid] = (yes_tok_id, no_tok_id)
-    if clob_markets and not source_label.startswith("clob"):
-        source_label = "mixed"
-
-    # ── Phase 1: Gamma standard paginated discovery (fallback) ────────────
+    # ── Phase 1: Gamma standard paginated discovery ────────────
     if not any((m.end_ts - time.time()) <= 3600 for m in new_markets.values()):
         for offset in range(0, 2000, 100):
             if state.shutdown.is_set():
@@ -757,8 +671,10 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
     SEARCH_QUERIES = [
         "Bitcoin up or down",
         "BTC up or down",
-        "Bitcoin Up or Down",
-        "bitcoin up or down at",
+        "Bitcoin higher or lower",
+        "BTC higher or lower",
+        "Bitcoin 5m",
+        "Bitcoin 15m",
     ]
     now_ts_s = time.time()
     if not any((m.end_ts - now_ts_s) <= 3600 for m in new_markets.values()):
@@ -770,7 +686,7 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
                 async with session.get(
                     search_url,
                     params={
-                        "limit": "50",
+                        "limit": "100",
                         "search": query,
                         "active": "true",
                         "closed": "false",
@@ -793,36 +709,40 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
             except Exception:
                 continue
 
-    # ── Phase 3: Gamma slug-based single-market fallback ──────────────────
+    # ── Phase 3: Gamma events fallback ────────────────────────────────────
     now_ts_s3 = time.time()
     if not any((m.end_ts - now_ts_s3) <= 3600 for m in new_markets.values()):
-        slug_patterns: list[str] = []
-        for mkt in new_markets.values():
-            q = mkt.question.lower()
-            m = _re.search(r"\d{1,2}:\d{2}", q)
-            if m:
-                t = m.group(0)
-                slug_patterns.append(f"bitcoin-up-or-down-at-{t}-et")
-                slug_patterns.append(f"bitcoin-up-or-down-{t}")
-                slug_patterns.append(f"btc-up-or-down-at-{t}-et")
-        slug_patterns = list(dict.fromkeys(slug_patterns))[:8]
-        for slug in slug_patterns:
+        for query in SEARCH_QUERIES[:4]:
             if state.shutdown.is_set():
                 break
             try:
                 async with session.get(
-                    f"{GAMMA_URL}/markets/{slug}", timeout=timeout
+                    f"{GAMMA_URL}/events",
+                    params={
+                        "limit": "25",
+                        "search": query,
+                        "active": "true",
+                        "closed": "false",
+                    },
+                    timeout=timeout,
                 ) as resp:
-                    if resp.status != 200:
+                    resp.raise_for_status()
+                    events = await resp.json(content_type=None)
+                if not isinstance(events, list):
+                    continue
+                for event in events:
+                    markets = event.get("markets") if isinstance(event, dict) else None
+                    if not isinstance(markets, list):
                         continue
-                    m = await resp.json(content_type=None)
-                if isinstance(m, dict) and m.get("id"):
-                    _ingest_item(m)
-                    if (new_markets.get(str(m["id"]))) is not None:
-                        if (new_markets[str(m["id"])].end_ts - time.time()) <= 3600:
-                            if source_label in ("gamma", "search"):
-                                source_label = "mixed"
-                            break
+                    for m in markets:
+                        if isinstance(m, dict):
+                            _ingest_item(m)
+                if source_label == "gamma":
+                    source_label = "events"
+                if any(
+                    (m.end_ts - time.time()) <= 3600 for m in new_markets.values()
+                ):
+                    break
             except Exception:
                 continue
 
@@ -834,6 +754,8 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
             filtered[mid] = mkt
     if filtered:
         new_markets = filtered
+    if any(m.source == "clob" for m in new_markets.values()) and source_label != "clob":
+        source_label = "mixed"
 
     state.poly_markets = new_markets
     log.info("[DISC] %d BTC markets discovered", len(new_markets))
@@ -857,6 +779,133 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
         )
     else:
         log.info("[DISCOVERY-DIAG] total=0 btc=0 short_term_180=0 short_term_3600=0 source=%s", source_label)
+
+
+def _as_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _is_open_market(m: dict) -> bool:
+    if m.get("active") is False:
+        return False
+    if m.get("closed") is True or m.get("archived") is True:
+        return False
+    # Gamma uses acceptingOrders, CLOB uses accepting_orders.
+    accepting = m.get("accepting_orders")
+    if accepting is None:
+        accepting = m.get("acceptingOrders")
+    return accepting is not False
+
+
+def _parse_end_ts(m: dict) -> Optional[float]:
+    from datetime import datetime, timezone
+
+    raw = (
+        m.get("end_date_iso")
+        or m.get("endDate")
+        or m.get("endDateIso")
+        or m.get("end_date")
+    )
+    if not raw:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        text = f"{text}T00:00:00Z"
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _looks_like_btc_short_term(question: str, m: dict) -> bool:
+    import re as _re
+
+    blob = " ".join(
+        str(v or "") for v in (
+            question,
+            m.get("title"),
+            m.get("market_slug"),
+            m.get("slug"),
+            m.get("description"),
+            m.get("groupItemTitle"),
+        )
+    ).lower()
+    if not any(kw in blob for kw in ASSET_KW.get("BTC", ["bitcoin", "btc"])):
+        return False
+    if "up or down" not in blob and "higher or lower" not in blob:
+        return False
+    # 5m/15m markets include a concrete clock time in the title/slug.
+    return bool(_re.search(r"\d{1,2}:\d{2}", blob) or "5m" in blob or "15m" in blob)
+
+
+def _extract_clob_token_ids(m: dict) -> Optional[tuple[str, str]]:
+    raw = m.get("clobTokenIds")
+    if raw:
+        try:
+            ids = raw if isinstance(raw, list) else json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            ids = []
+        if isinstance(ids, list) and len(ids) >= 2 and ids[0] and ids[1]:
+            return str(ids[0]), str(ids[1])
+
+    tokens = m.get("tokens") or []
+    yes_tok = None
+    no_tok = None
+    fallback: list[str] = []
+    if isinstance(tokens, list):
+        for tok in tokens:
+            if not isinstance(tok, dict):
+                continue
+            tid = str(tok.get("token_id") or tok.get("id") or "")
+            if not tid:
+                continue
+            fallback.append(tid)
+            outcome = str(tok.get("outcome") or "").strip().lower()
+            if outcome == "yes":
+                yes_tok = tid
+            elif outcome == "no":
+                no_tok = tid
+    if yes_tok and no_tok:
+        return yes_tok, no_tok
+    if len(fallback) >= 2:
+        return fallback[0], fallback[1]
+    return None
+
+
+def _parse_market_prices(m: dict) -> tuple[Optional[float], Optional[float]]:
+    yes = _parse_yes_price(m)
+    no = _parse_no_price(m)
+    if yes is not None:
+        return yes, no
+
+    tokens = m.get("tokens") or []
+    fallback: list[float] = []
+    if isinstance(tokens, list):
+        for tok in tokens:
+            if not isinstance(tok, dict):
+                continue
+            price = _as_float(tok.get("price"), default=-1.0)
+            if price < 0:
+                continue
+            fallback.append(price)
+            outcome = str(tok.get("outcome") or "").strip().lower()
+            if outcome == "yes":
+                yes = price
+            elif outcome == "no":
+                no = price
+    if yes is None and fallback:
+        yes = fallback[0]
+    if no is None and len(fallback) >= 2:
+        no = fallback[1]
+    return yes, no
 
 
 def _parse_yes_price(m: dict) -> Optional[float]:
@@ -1000,12 +1049,20 @@ def _clob_midpoint(book: dict) -> Optional[float]:
     asks = book.get("asks") or []
     if not bids or not asks:
         return None
-    try:
-        best_bid = float(bids[0].get("price") or bids[0] if isinstance(bids[0], (int, float)) else 0)
-        best_ask = float(asks[0].get("price") or asks[0] if isinstance(asks[0], (int, float)) else 0)
-    except (TypeError, ValueError, IndexError):
+
+    def _level_price(level) -> Optional[float]:
+        if isinstance(level, dict):
+            return _as_float(level.get("price"), default=-1.0)
+        if isinstance(level, (int, float, str)):
+            return _as_float(level, default=-1.0)
         return None
-    if best_bid <= 0 or best_ask <= 0:
+
+    try:
+        best_bid = _level_price(bids[0])
+        best_ask = _level_price(asks[0])
+    except IndexError:
+        return None
+    if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
         return None
     return (best_bid + best_ask) / 2.0
 
