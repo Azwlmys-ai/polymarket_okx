@@ -611,6 +611,10 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
         ) as resp:
             resp.raise_for_status()
             items = await resp.json(content_type=None)
+        log.info("[CLOB] raw items type=%s count=%s", type(items).__name__, len(items) if isinstance(items, list) else (len(items) if isinstance(items, dict) else "?"))
+        if isinstance(items, dict):
+            # CLOB may return {"data": [...], ...} or {"markets": [...]}
+            items = items.get("data") or items.get("markets") or items.get("results") or []
         if isinstance(items, list):
             for m in items:
                 if not isinstance(m, dict):
