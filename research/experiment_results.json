@@ -1,8 +1,28 @@
 {
-  "experiments": [],
-  "total_signals": 0,
+  "experiments": [
+    {
+      "experiment": "poly_price_lag",
+      "signal_count": 3,
+      "regime_breakdown": {
+        "late": 2,
+        "settlement": 1
+      },
+      "vol_breakdown": {
+        "low": 3
+      },
+      "win_rate": 1.0,
+      "mean_return": 0.0005594045048818249,
+      "median_return": 0.0005594045048818249,
+      "max_drawdown": 0.0,
+      "expectancy": 0.0005594045048818249,
+      "fee_adjusted_pnl": -0.020440595495118178,
+      "top_conditions": [],
+      "worst_conditions": []
+    }
+  ],
+  "total_signals": 3,
   "news_events": 0,
-  "okx_ticks": 1069,
-  "poly_polls": 80,
+  "okx_ticks": 1185,
+  "poly_polls": 98,
   "errors": 0
 }

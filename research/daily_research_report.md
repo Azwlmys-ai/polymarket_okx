@@ -2,16 +2,22 @@
 
 > **STATS_ONLY / PAPER_SIM — No real orders. No capital at risk.**
 
-**Generated:** 2026-05-20T17:55:10Z  
+**Generated:** 2026-05-20T18:07:52Z  
 **Session Duration:** 300s  
-**Total Signals:** 0  
+**Total Signals:** 3  
 **News Events:** 0  
 
 ---
 
 ## 1. Executive Summary
 
-_No signals collected yet. Run the research engine to gather data._
+| Experiment | N | Win Rate | Mean | Median | Expectancy | Fee-Adj PnL |
+|---|---|---|---|---|---|---|
+| **poly_price_lag** | 3 | 100.0000% | 0.0559% | 0.0559% | 0.0559% | -2.0441% |
+
+### ✅ Positive Edge Detected
+
+- **poly_price_lag**: expectancy=0.0559%, win_rate=100.0000%, n=3
 
 ---
 
@@ -22,13 +28,13 @@ _No signals collected yet. Run the research engine to gather data._
 |---|---|
 | early | 0 | 0.0% |
 | mid | 0 | 0.0% |
-| late | 0 | 0.0% |
-| settlement | 0 | 0.0% |
+| late | 2 | 66.7% |
+| settlement | 1 | 33.3% |
 
 ### Volatility Regime Distribution
 | Regime | Count | Pct |
 |---|---|
-| low | 0 | 0.0% |
+| low | 3 | 100.0% |
 | medium | 0 | 0.0% |
 | high | 0 | 0.0% |
 
@@ -54,10 +60,16 @@ Analysis of BTC mean reversion following Polymarket settlement when YES price re
 
 ### Verdict: **NO-GO**
 
-**Reason:** No experiment summaries available.
+**Reason:** Failed criteria: c1_signal_count_ge_50, c2_expectancy_gt_0_after_fee, c3_median_gt_0_after_fee, c4_win_rate_vs_baseline, c5_min_2_sessions, c7_not_concentrated
 
 | Criterion | Result | Value | Threshold |
 |---|---|---|---|
+| c1_signal_count_ge_50 | ❌ | 3 | 50 |
+| c2_expectancy_gt_0_after_fee | ❌ | -0.020441 | 0 |
+| c3_median_gt_0_after_fee | ❌ | -0.020441 | 0 |
+| c4_win_rate_vs_baseline | ❌ | 1.000000 | 0.05 |
+| c6_max_drawdown_ok | ✅ | 0.000000 | < 0.10 (10%) |
+| c7_not_concentrated | ❌ | 3/3 | ≤ 70% |
 
 > ⚠️ **Multi-session**: ≥2 independent sessions required before paper execution.
 

@@ -565,7 +565,11 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
         end_ts = _parse_end_ts(m)
         if end_ts is None:
             return None
-        ttl = end_ts - time.time()
+        now_ts = time.time()
+        start_ts = _parse_event_start_ts(m)
+        if start_ts is not None and start_ts - now_ts > 10:
+            return None
+        ttl = end_ts - now_ts
         if ttl <= 0 or ttl > 3600:
             return None
         liq = _as_float(m.get("liquidityClob") or m.get("liquidity") or 0)
@@ -600,6 +604,8 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
     clob_markets: dict[str, dict] = {}
     clob_seen = 0
     clob_active = 0
+    deterministic_hits = 0
+    deterministic_slug = ""
     try:
         # Public CLOB markets are paginated and may include old/closed rows,
         # so all short-term/open filtering stays local and explicit.
@@ -643,6 +649,58 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
         CLOB_URL, clob_seen, clob_active, len(clob_markets),
         clob_short_3600, clob_short_180, clob_ttls[0] if clob_ttls else -1,
     )
+
+    # ── Phase 0.5: deterministic recurring crypto slugs ──────────────────
+    # Polymarket crypto pages expose slugs like btc-updown-5m-<period_start>.
+    # The slug resolves through Gamma to the event + market + clobTokenIds.
+    for slug in _candidate_btc_updown_slugs(time.time()):
+        if state.shutdown.is_set():
+            break
+        try:
+            async with session.get(
+                f"{GAMMA_URL}/events/slug/{slug}",
+                timeout=timeout,
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                event = await resp.json(content_type=None)
+            if not isinstance(event, dict):
+                continue
+            event_start = event.get("startTime")
+            markets = event.get("markets") or []
+            if not isinstance(markets, list):
+                continue
+            for m in markets:
+                if not isinstance(m, dict):
+                    continue
+                if event_start and not m.get("eventStartTime"):
+                    m["eventStartTime"] = event_start
+                before = len(new_markets)
+                mid = _ingest_item(m, default_source="clob")
+                if mid and len(new_markets) > before:
+                    deterministic_hits += 1
+                    deterministic_slug = slug
+            if any((m.end_ts - time.time()) <= 3600 for m in new_markets.values()):
+                source_label = "deterministic"
+                break
+        except Exception as exc:
+            log.debug("[DISC] deterministic slug %s failed: %s", slug, exc)
+
+    if deterministic_hits:
+        now_ts_det = time.time()
+        det_ttls = sorted(
+            m.end_ts - now_ts_det for m in new_markets.values()
+            if m.source == "clob"
+        )
+        log.info(
+            "[CLOB-DIAG] endpoint=%s/events/slug/<btc-updown> deterministic=%d "
+            "short_term_3600=%d ttl_min=%.0fs slug=%s",
+            GAMMA_URL,
+            deterministic_hits,
+            sum(1 for t in det_ttls if t <= 3600),
+            det_ttls[0] if det_ttls else -1,
+            deterministic_slug,
+        )
 
     # ── Phase 1: Gamma standard paginated discovery ────────────
     if not any((m.end_ts - time.time()) <= 3600 for m in new_markets.values()):
@@ -823,6 +881,35 @@ def _parse_end_ts(m: dict) -> Optional[float]:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.timestamp()
+
+
+def _parse_event_start_ts(m: dict) -> Optional[float]:
+    from datetime import datetime, timezone
+
+    raw = m.get("eventStartTime") or m.get("startTime")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _candidate_btc_updown_slugs(now_ts: float) -> list[str]:
+    slugs: list[str] = []
+    for minutes in (5, 15):
+        interval_s = minutes * 60
+        base = int(now_ts // interval_s * interval_s)
+        # Try current first, then nearby windows for clock skew/API lag.
+        for offset in (0, -1, 1, -2, 2):
+            start = base + offset * interval_s
+            if start <= 0:
+                continue
+            slugs.append(f"btc-updown-{minutes}m-{start}")
+    return list(dict.fromkeys(slugs))
 
 
 def _looks_like_btc_short_term(question: str, m: dict) -> bool:
@@ -1057,12 +1144,19 @@ def _clob_midpoint(book: dict) -> Optional[float]:
             return _as_float(level, default=-1.0)
         return None
 
-    try:
-        best_bid = _level_price(bids[0])
-        best_ask = _level_price(asks[0])
-    except IndexError:
+    bid_prices = [
+        p for p in (_level_price(level) for level in bids)
+        if p is not None and p > 0
+    ]
+    ask_prices = [
+        p for p in (_level_price(level) for level in asks)
+        if p is not None and p > 0
+    ]
+    if not bid_prices or not ask_prices:
         return None
-    if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+    best_bid = max(bid_prices)
+    best_ask = min(ask_prices)
+    if best_bid <= 0 or best_ask <= 0:
         return None
     return (best_bid + best_ask) / 2.0
 
