@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 from research.engine import (
+    binance_ref_ws_task,
+    bybit_ref_ws_task,
     EngineState,
     heartbeat_task,
     okx_ws_task,
@@ -230,6 +232,8 @@ async def _run(duration_s: float, enable_news: bool) -> None:
         asyncio.create_task(poly_discovery_task(state), name="disc"),
         asyncio.create_task(poly_poll_task(state), name="poly"),
         asyncio.create_task(okx_ws_task(state), name="okx"),
+        asyncio.create_task(binance_ref_ws_task(state), name="binance"),
+        asyncio.create_task(bybit_ref_ws_task(state), name="bybit"),
         asyncio.create_task(signal_detection_task(state), name="detect"),
         asyncio.create_task(heartbeat_task(state, duration_s), name="heart"),
     ]
@@ -275,8 +279,8 @@ async def _run(duration_s: float, enable_news: bool) -> None:
     log.info(" Signals: %d raw, %d tagged | News: %d",
              len(state.raw_events), len(state.tagged_signals),
              len(state.news_events))
-    log.info(" OKX ticks: %d | Poly polls: %d | Markets: %d | Errors: %d",
-             state.okx_ticks, state.poly_polls,
+    log.info(" Ticks OKX/BNB/BYBIT: %d/%d/%d | Poly polls: %d | Markets: %d | Errors: %d",
+             state.okx_ticks, state.binance_ticks, state.bybit_ticks, state.poly_polls,
              len(state.poly_markets), state.errors)
     log.info(" Report: %s", DAILY_REPORT_PATH)
     log.info(" JSONL:  research/raw_events.jsonl, research/tagged_signals.jsonl")

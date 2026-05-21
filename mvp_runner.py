@@ -83,6 +83,7 @@ STOP_LOSS_PCT       = 0.12         # YES 价格相对入场价下跌 >=12% 时 p
 MIN_TIME_REMAINING_S = 300.0       # 市场至少还有 5 分钟才允许入场
 INITIAL_CASH        = 1000.0       # 初始模拟资金（USDC）
 RISK_PER_TRADE_PCT  = 0.02         # 每笔最大风险（2%）
+MAX_SESSION_LOSS_PCT = 0.20        # session 总亏损熔断线：权益跌幅 ≥ 20% → 停止开仓并 shutdown
 
 # Step 9 — 并发扫描超时
 SCAN_TIMEOUT_OKX_S  = 6.0          # 单次 OKX REST 轮询超时（秒）
@@ -815,6 +816,44 @@ async def strategy_task() -> None:
             pass
 
 
+def _get_session_equity() -> float:
+    """
+    Current session equity = cash + mark-to-market value of all open positions.
+
+    Mark-to-market: for each open position we use the latest available YES price
+    from poly_latest.  If no price is available we fall back to the entry price
+    (conservative: treats the position at cost, not at a loss).
+
+    This reflects total capital-at-risk, not just the realised cash balance.
+    """
+    equity = state.cash
+    for pos in state.open_positions:
+        pm = state.poly_latest.get(pos.poly_market_id)
+        mark_price = pm.yes_price if pm is not None else pos.entry_yes_price
+        equity += mark_price * pos.quantity
+    return equity
+
+
+def _check_session_loss_cap() -> bool:
+    """
+    Returns True (and triggers shutdown) when session equity has fallen by
+    MAX_SESSION_LOSS_PCT or more from INITIAL_CASH.
+
+    Called before every new position is opened.
+    """
+    equity = _get_session_equity()
+    loss_pct = max(0.0, (INITIAL_CASH - equity) / INITIAL_CASH)
+    if loss_pct >= MAX_SESSION_LOSS_PCT:
+        log.warning(
+            "[CIRCUIT BREAKER] Session loss cap hit: equity=%.4f (−%.1f%% of %.2f). "
+            "No new positions. Shutting down.",
+            equity, loss_pct * 100, INITIAL_CASH,
+        )
+        state.shutdown.set()
+        return True
+    return False
+
+
 def _detect_signals() -> None:
     now_ms = int(time.time() * 1000)
     now_mono = time.monotonic()
@@ -907,6 +946,8 @@ def _detect_signals() -> None:
             poly_symbol=matched_pm.symbol,
             poly_yes_price=matched_pm.yes_price,
         )
+        if _check_session_loss_cap():
+            return
         state.signals.append(sig)
         _open_position(sig, matched_pm)
 
@@ -1294,6 +1335,13 @@ async def _run(duration_s: float) -> None:
 
 
 def main() -> None:
+    # ── Safety gate: must be the first thing that runs ──────────────────────
+    # Raises SafetyBoundaryError and aborts if any unsafe flag is set in the
+    # environment (ALLOW_REAL_TRADING, ALLOW_PRIVATE_KEYS, etc.).
+    # Defaults are all False, so a plain `python3 mvp_runner.py` always passes.
+    from src.config import get_settings  # local import avoids circular import at module level
+    get_settings().safety_flags.enforce_phase_one()
+
     global MOVE_THRESHOLD_PCT
     parser = argparse.ArgumentParser(
         description="Polymarket × OKX Paper Trade MVP Runner"

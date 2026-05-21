@@ -35,6 +35,7 @@ class ExperimentType(str, Enum):
     SETTLEMENT_REVERSION = "settlement_reversion"
     POLY_PRICE_LAG = "poly_price_lag"
     SPREAD_DISTORTION = "spread_distortion"
+    REFERENCE_MISPRICING = "reference_mispricing"
     NEWS_EVENT = "news_event"
 
 
@@ -69,6 +70,18 @@ class ResearchSignal:
     btc_60s_return: Optional[float] = None
     btc_120s_return: Optional[float] = None
     btc_volatility_60s: Optional[float] = None
+
+    # ── Cross-exchange reference pricing ─────────────────────────────────────
+    okx_price: Optional[float] = None
+    binance_price: Optional[float] = None
+    bybit_price: Optional[float] = None
+    median_price: Optional[float] = None
+    price_to_beat: Optional[float] = None
+    distance_to_beat_bps: Optional[float] = None
+    exchange_spread_bps: Optional[float] = None
+    direction_consensus: Optional[str] = None
+    poly_midpoint: Optional[float] = None
+    mispricing_bps: Optional[float] = None
 
     # ── Signal metadata ────────────────────────────────────────────────────────
     signal_direction: SignalDirection = SignalDirection.NEUTRAL

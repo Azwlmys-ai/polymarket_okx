@@ -17,7 +17,7 @@ import logging
 import os
 import ssl
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -81,6 +81,8 @@ DAILY_REPORT_PATH = Path("research/daily_research_report.md")
 # Volatility regime classification
 VOL_LOW_THRESH = float(os.environ.get("VOL_LOW_THRESH", "0.0005"))   # 5 bps
 VOL_HIGH_THRESH = float(os.environ.get("VOL_HIGH_THRESH", "0.0020"))  # 20 bps
+REFERENCE_DISTANCE_BPS = float(os.environ.get("REFERENCE_DISTANCE_BPS", "5.0"))
+REFERENCE_MAX_EXCHANGE_SPREAD_BPS = float(os.environ.get("REFERENCE_MAX_EXCHANGE_SPREAD_BPS", "3.0"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +111,7 @@ class PolyMarketState:
     last_price_change: float = 0.0
     yes_history: list[PricePoint] = field(default_factory=list)
     source: str = "gamma"  # "gamma" or "clob"
+    price_to_beat: Optional[float] = None
 
 
 @dataclass
@@ -123,6 +126,18 @@ class EngineState:
     btc_history: list[PricePoint] = field(default_factory=list)
     btc_price: Optional[float] = None
     okx_ticks: int = 0
+
+    # Binance/Bybit BTC reference feeds (read-only)
+    binance_history: dict[str, deque] = field(
+        default_factory=lambda: defaultdict(lambda: deque(maxlen=BTC_HISTORY_MAXLEN))
+    )
+    bybit_history: dict[str, deque] = field(
+        default_factory=lambda: defaultdict(lambda: deque(maxlen=BTC_HISTORY_MAXLEN))
+    )
+    binance_price: Optional[float] = None
+    bybit_price: Optional[float] = None
+    binance_ticks: int = 0
+    bybit_ticks: int = 0
 
     # Output buffers
     raw_events: list[ResearchSignal] = field(default_factory=list)
@@ -148,7 +163,7 @@ class EngineState:
 
     # Stats
     errors: int = 0
-    reconnect_counts: dict = field(default_factory=lambda: {"okx": 0})
+    reconnect_counts: dict = field(default_factory=lambda: {"okx": 0, "binance": 0, "bybit": 0})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +249,75 @@ def _percentile(sv: list[float], p: float) -> float:
 
 def _fmt_pct(value: Optional[float]) -> str:
     return "N/A" if value is None else f"{value:.4%}"
+
+
+def _median(values: list[float]) -> Optional[float]:
+    clean = sorted(v for v in values if v and v > 0)
+    n = len(clean)
+    if n == 0:
+        return None
+    mid = n // 2
+    if n % 2:
+        return clean[mid]
+    return (clean[mid - 1] + clean[mid]) / 2.0
+
+
+def _reference_snapshot(state: "EngineState", market: "PolyMarketState") -> dict[str, Optional[float] | Optional[str]]:
+    """Build an OKX/Binance/Bybit BTC consensus snapshot for signal tagging."""
+    okx_price = state.btc_price
+    binance_price = state.binance_price
+    bybit_price = state.bybit_price
+    prices = [okx_price, binance_price, bybit_price]
+    full_prices = [p for p in prices if p is not None and p > 0]
+    median_price = _median(full_prices) if len(full_prices) == 3 else None
+    exchange_spread_bps = None
+    if median_price:
+        exchange_spread_bps = (max(full_prices) - min(full_prices)) / median_price * 10000
+
+    price_to_beat = market.price_to_beat
+    distance_to_beat_bps = None
+    direction_consensus = None
+    if median_price and price_to_beat and price_to_beat > 0:
+        distance_to_beat_bps = (median_price - price_to_beat) / price_to_beat * 10000
+        if median_price > price_to_beat:
+            direction_consensus = "UP"
+        elif median_price < price_to_beat:
+            direction_consensus = "DOWN"
+        else:
+            direction_consensus = "FLAT"
+
+    poly_midpoint = market.yes_price
+    mispricing_bps = None
+    if direction_consensus == "UP":
+        mispricing_bps = (1.0 - poly_midpoint) * 10000
+    elif direction_consensus == "DOWN":
+        mispricing_bps = poly_midpoint * 10000
+
+    return {
+        "okx_price": okx_price,
+        "binance_price": binance_price,
+        "bybit_price": bybit_price,
+        "median_price": median_price,
+        "price_to_beat": price_to_beat,
+        "distance_to_beat_bps": distance_to_beat_bps,
+        "exchange_spread_bps": exchange_spread_bps,
+        "direction_consensus": direction_consensus,
+        "poly_midpoint": poly_midpoint,
+        "mispricing_bps": mispricing_bps,
+    }
+
+
+def _apply_reference_fields(sig: ResearchSignal, ref: dict[str, Optional[float] | Optional[str]]) -> None:
+    sig.okx_price = ref["okx_price"]  # type: ignore[assignment]
+    sig.binance_price = ref["binance_price"]  # type: ignore[assignment]
+    sig.bybit_price = ref["bybit_price"]  # type: ignore[assignment]
+    sig.median_price = ref["median_price"]  # type: ignore[assignment]
+    sig.price_to_beat = ref["price_to_beat"]  # type: ignore[assignment]
+    sig.distance_to_beat_bps = ref["distance_to_beat_bps"]  # type: ignore[assignment]
+    sig.exchange_spread_bps = ref["exchange_spread_bps"]  # type: ignore[assignment]
+    sig.direction_consensus = ref["direction_consensus"]  # type: ignore[assignment]
+    sig.poly_midpoint = ref["poly_midpoint"]  # type: ignore[assignment]
+    sig.mispricing_bps = ref["mispricing_bps"]  # type: ignore[assignment]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -448,6 +532,74 @@ def detect_spread_distortion(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Experiment D: Cross-exchange Reference Mispricing
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def detect_reference_mispricing(
+    market: PolyMarketState,
+    state: EngineState,
+    now_ts: float,
+) -> Optional[ResearchSignal]:
+    """Detect Poly YES/NO disagreement with OKX/Binance/Bybit BTC consensus."""
+    ref = _reference_snapshot(state, market)
+    ttl = market.end_ts - now_ts
+    if ttl <= 0 or ttl > 180:
+        return None
+    if ref["price_to_beat"] is None or ref["median_price"] is None:
+        return None
+    if ref["exchange_spread_bps"] is None or ref["exchange_spread_bps"] > REFERENCE_MAX_EXCHANGE_SPREAD_BPS:
+        return None
+    if ref["distance_to_beat_bps"] is None or abs(ref["distance_to_beat_bps"]) < REFERENCE_DISTANCE_BPS:
+        return None
+
+    yes = market.yes_price
+    direction = ref["direction_consensus"]
+    if direction == "UP":
+        signal_direction = SignalDirection.JUMP
+        diverges = yes <= 0.40
+    elif direction == "DOWN":
+        signal_direction = SignalDirection.DROP
+        diverges = yes >= 0.60
+    else:
+        return None
+
+    neutral_poly = 0.40 <= yes <= 0.60
+    if not (neutral_poly or diverges):
+        return None
+
+    btc_vol = compute_volatility(state.btc_history, 60, now_ts)
+    sig = ResearchSignal(
+        timestamp=now_ts,
+        market_id=market.market_id,
+        market_question=market.question,
+        experiment=ExperimentType.REFERENCE_MISPRICING,
+        time_to_expiry_s=ttl,
+        poly_yes_price=market.yes_price,
+        poly_no_price=market.no_price,
+        poly_spread=market.spread,
+        poly_volume=market.volume,
+        poly_last_price_change=market.last_price_change,
+        btc_price=state.btc_price or 0.0,
+        btc_30s_return=compute_return(state.btc_history, now_ts - 30, 30),
+        btc_60s_return=compute_return(state.btc_history, now_ts - 60, 60),
+        btc_120s_return=compute_return(state.btc_history, now_ts - 120, 120),
+        btc_volatility_60s=btc_vol,
+        signal_direction=signal_direction,
+        signal_strength=min(abs(ref["distance_to_beat_bps"]) / 50.0, 1.0),
+        trigger_reason=(
+            "reference_mispricing: "
+            f"dir={direction} dist={ref['distance_to_beat_bps']:.2f}bps "
+            f"xspread={ref['exchange_spread_bps']:.2f}bps yes={yes:.4f}"
+        ),
+        market_phase=classify_market_phase(ttl),
+        volatility_regime=classify_volatility_regime(btc_vol),
+    )
+    _apply_reference_fields(sig, ref)
+    return sig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Forward fill
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -595,6 +747,7 @@ async def _discover_markets(session: aiohttp.ClientSession, state: EngineState) 
             liquidity=liq,
             end_ts=end_ts,
             source=source,
+            price_to_beat=_parse_price_to_beat(m),
         )
         if token_ids:
             state.clob_token_ids[mid] = token_ids
@@ -1019,6 +1172,49 @@ def _parse_no_price(m: dict) -> Optional[float]:
     return None
 
 
+def _parse_price_to_beat(m: dict) -> Optional[float]:
+    """Best-effort parse for BTC Up/Down start/target price from market metadata."""
+    for key in (
+        "price_to_beat",
+        "priceToBeat",
+        "targetPrice",
+        "target_price",
+        "strike",
+        "strikePrice",
+        "startPrice",
+        "start_price",
+    ):
+        value = _as_float(m.get(key), default=0.0)
+        if value > 1000:
+            return value
+
+    import re as _re
+
+    text = " ".join(
+        str(v or "") for v in (
+            m.get("question"),
+            m.get("title"),
+            m.get("description"),
+            m.get("groupItemTitle"),
+        )
+    )
+    patterns = [
+        r"(?:above|below|higher than|lower than|start(?:ing)? price(?: of)?|price to beat)\s*\$?\s*([0-9][0-9,]+(?:\.\d+)?)",
+        r"\$\s*([0-9][0-9,]+(?:\.\d+)?)",
+    ]
+    for pattern in patterns:
+        match = _re.search(pattern, text, flags=_re.IGNORECASE)
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if value > 1000:
+            return value
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Async I/O: Polymarket poll
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1271,6 +1467,50 @@ def _handle_okx_msg(raw: str, state: EngineState) -> None:
     state.okx_ticks += 1
 
 
+async def binance_ref_ws_task(state: EngineState) -> None:
+    """Stream Binance BTCUSDT trades as a read-only reference price feed."""
+    from src.binance_client import binance_ws_task
+
+    def _on_tick(asset: str, pt) -> None:
+        if asset != "BTC":
+            return
+        state.binance_price = pt.price
+        state.binance_ticks += 1
+
+    def _on_reconnect() -> None:
+        state.reconnect_counts["binance"] = state.reconnect_counts.get("binance", 0) + 1
+
+    await binance_ws_task(
+        state.binance_history,
+        state.shutdown,
+        assets=["BTC"],
+        on_tick=_on_tick,
+        on_reconnect=_on_reconnect,
+    )
+
+
+async def bybit_ref_ws_task(state: EngineState) -> None:
+    """Stream Bybit BTCUSDT public trades as a read-only reference price feed."""
+    from src.bybit_client import bybit_ws_task
+
+    def _on_tick(asset: str, pt) -> None:
+        if asset != "BTC":
+            return
+        state.bybit_price = pt.price
+        state.bybit_ticks += 1
+
+    def _on_reconnect() -> None:
+        state.reconnect_counts["bybit"] = state.reconnect_counts.get("bybit", 0) + 1
+
+    await bybit_ws_task(
+        state.bybit_history,
+        state.shutdown,
+        topics=["publicTrade.BTCUSDT"],
+        on_tick=_on_tick,
+        on_reconnect=_on_reconnect,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Signal detection loop
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1297,7 +1537,7 @@ async def signal_detection_task(state: EngineState) -> None:
 
 
 def _run_experiments(state: EngineState, now_ts: float, cooldowns: dict[str, float]) -> None:
-    """Run experiments A, B, C on all active markets."""
+    """Run experiments A, B, C, D on all active markets."""
     for mid, mkt in list(state.poly_markets.items()):
         # Cooldown: max 1 signal per market per 30s
         if now_ts - cooldowns.get(mid, 0) < 30:
@@ -1313,11 +1553,13 @@ def _run_experiments(state: EngineState, now_ts: float, cooldowns: dict[str, flo
         # ── Experiment A: Settlement Reversion ────────────────────────────────
         sig_a = detect_settlement_reversion(mkt, state.btc_history, now_ts)
         if sig_a:
+            ref = _reference_snapshot(state, mkt)
             sig_a.btc_price = btc_price
             sig_a.btc_30s_return = btc_30s
             sig_a.btc_60s_return = btc_60s
             sig_a.btc_120s_return = btc_120s
             sig_a.btc_volatility_60s = btc_vol
+            _apply_reference_fields(sig_a, ref)
             state.raw_events.append(sig_a)
             state.tagged_signals.append(sig_a)
             _append_jsonl(RAW_EVENTS_PATH, sig_a.to_jsonl())
@@ -1337,11 +1579,13 @@ def _run_experiments(state: EngineState, now_ts: float, cooldowns: dict[str, flo
         # ── Experiment B: Poly Price Lag ──────────────────────────────────────
         sig_b = detect_poly_price_lag(mkt, state.btc_history, now_ts)
         if sig_b:
+            ref = _reference_snapshot(state, mkt)
             sig_b.btc_price = btc_price
             sig_b.btc_30s_return = btc_30s
             sig_b.btc_60s_return = btc_60s
             sig_b.btc_120s_return = btc_120s
             sig_b.btc_volatility_60s = btc_vol
+            _apply_reference_fields(sig_b, ref)
             state.raw_events.append(sig_b)
             state.tagged_signals.append(sig_b)
             _append_jsonl(RAW_EVENTS_PATH, sig_b.to_jsonl())
@@ -1360,11 +1604,13 @@ def _run_experiments(state: EngineState, now_ts: float, cooldowns: dict[str, flo
         liq_hist = state.liquidity_history.get(mid, [])
         sig_c = detect_spread_distortion(mkt, spread_hist, liq_hist, now_ts)
         if sig_c:
+            ref = _reference_snapshot(state, mkt)
             sig_c.btc_price = btc_price
             sig_c.btc_30s_return = btc_30s
             sig_c.btc_60s_return = btc_60s
             sig_c.btc_120s_return = btc_120s
             sig_c.btc_volatility_60s = btc_vol
+            _apply_reference_fields(sig_c, ref)
             state.raw_events.append(sig_c)
             state.tagged_signals.append(sig_c)
             _append_jsonl(RAW_EVENTS_PATH, sig_c.to_jsonl())
@@ -1375,6 +1621,27 @@ def _run_experiments(state: EngineState, now_ts: float, cooldowns: dict[str, flo
             log.info(
                 "[EXP-C] Spread Distortion | %s spread=%.4f liq=%.0f phase=%s",
                 mkt.asset, sig_c.poly_spread, mkt.liquidity, sig_c.market_phase.value,
+            )
+            continue
+
+        # ── Experiment D: Cross-exchange Reference Mispricing ─────────────────
+        sig_d = detect_reference_mispricing(mkt, state, now_ts)
+        if sig_d:
+            state.raw_events.append(sig_d)
+            state.tagged_signals.append(sig_d)
+            _append_jsonl(RAW_EVENTS_PATH, sig_d.to_jsonl())
+            _append_jsonl(TAGGED_SIGNALS_PATH, sig_d.to_jsonl())
+            for h in [15, 30, 60, 300]:
+                state.pending_fills.append((sig_d, now_ts + h))
+            cooldowns[mid] = now_ts
+            log.info(
+                "[EXP-D] Ref Mispricing | %s ttl=%.1fs dir=%s dist=%.2fbps xspread=%.2fbps yes=%.4f",
+                mkt.asset,
+                sig_d.time_to_expiry_s,
+                sig_d.direction_consensus or "N/A",
+                sig_d.distance_to_beat_bps or 0.0,
+                sig_d.exchange_spread_bps or 0.0,
+                sig_d.poly_yes_price,
             )
 
 
@@ -1424,6 +1691,8 @@ def save_experiment_results(state: EngineState) -> None:
         "total_signals": len(state.tagged_signals),
         "news_events": len(state.news_events),
         "okx_ticks": state.okx_ticks,
+        "binance_ticks": state.binance_ticks,
+        "bybit_ticks": state.bybit_ticks,
         "poly_polls": state.poly_polls,
         "errors": state.errors,
     }
@@ -1455,10 +1724,11 @@ async def heartbeat_task(state: EngineState, duration_s: float) -> None:
             1 for s in state.tagged_signals if s.btc_return_60s is not None
         )
         log.info(
-            "━━ %.0f/%.0fs | BTC ticks: %d | Poly markets: %d polls: %d | "
+            "━━ %.0f/%.0fs | Ticks OKX/BNB/BYBIT: %d/%d/%d | Poly markets: %d polls: %d | "
             "Raw: %d | Tagged: %d (complete: %d) | News: %d | Errors: %d ━━",
             elapsed, duration_s,
-            state.okx_ticks, len(state.poly_markets), state.poly_polls,
+            state.okx_ticks, state.binance_ticks, state.bybit_ticks,
+            len(state.poly_markets), state.poly_polls,
             len(state.raw_events), len(state.tagged_signals), complete,
             len(state.news_events), state.errors,
         )
