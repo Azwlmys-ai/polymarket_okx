@@ -168,7 +168,13 @@ class RunState:
     binance_ticks: int = 0
     bybit_ticks: int = 0
     poly_polls: int = 0
+    poly_ws_events: int = 0    # events received via WebSocket
     errors: int = 0
+    poly_source: str = "http"  # "http" | "ws" | "both" — set by main()
+    # condition_id (hex) → Gamma market_id (numeric str) — populated by _discover_poly
+    condition_id_to_market: dict[str, str] = field(default_factory=dict)
+    # YES/NO token_ids for WS subscription: market_id → [yes_token, no_token]
+    market_token_ids: dict[str, list[str]] = field(default_factory=dict)
     shutdown: asyncio.Event = field(default_factory=asyncio.Event)
     start_ts: float = field(default_factory=time.monotonic)
 
@@ -527,6 +533,16 @@ async def _discover_poly(session: aiohttp.ClientSession) -> None:
                     continue   # about to expire
                 title = m.get("question") or d.get("title") or slug
                 state.poly_markets[mid] = (okx_sym, title[:80], now + ttl)
+                # Store condition_id and token_ids for WS subscription
+                cond_id = str(m.get("conditionId") or "")
+                if cond_id:
+                    state.condition_id_to_market[cond_id] = mid
+                try:
+                    raw_ids = m.get("clobTokenIds") or "[]"
+                    ids = json.loads(raw_ids) if isinstance(raw_ids, str) else raw_ids
+                    state.market_token_ids[mid] = [str(t) for t in ids]
+                except Exception:
+                    pass
                 count += 1
                 log.debug("[POLY] %s mid=%s ttl=%.0fs yes=%.3f", slug, mid, ttl, yes_p)
             except Exception as exc:
@@ -648,6 +664,62 @@ def _update_poly_samples_for_market(market_id: str, ts_ms: int, yes_price: float
 # ---------------------------------------------------------------------------
 # Signal detection
 # ---------------------------------------------------------------------------
+
+async def poly_ws_task() -> None:
+    """
+    Polymarket CLOB market WebSocket feed (read-only, optional).
+
+    Activated when --poly-source ws or both.  Receives sub-second price events
+    and writes them into state.poly_history with millisecond timestamps,
+    eliminating the 2s HTTP quantization floor.
+    """
+    from src.polymarket_ws import polymarket_ws_task, PolyWSEvent
+
+    async def _on_event(ev: PolyWSEvent) -> None:
+        # Resolve market_id from condition_id
+        market_id = state.condition_id_to_market.get(ev.market_id)
+        if market_id is None:
+            # Try direct lookup (market_id may already be numeric)
+            market_id = ev.market_id
+
+        if market_id not in state.poly_markets:
+            return
+
+        # Only accept YES-token events (first in clobTokenIds)
+        known_tokens = state.market_token_ids.get(market_id, [])
+        if known_tokens and ev.token_id != known_tokens[0]:
+            return   # skip NO-token events
+
+        if ev.yes_price is None:
+            return
+
+        asset = state.poly_markets[market_id][0]
+        tick = CexTick(ts_ms=ev.ts_ms, source="poly_ws", asset=asset, price=ev.yes_price)
+        state.poly_history[market_id].append(tick)
+        state.poly_ws_events += 1
+        _update_poly_samples_for_market(market_id, ev.ts_ms, ev.yes_price)
+
+    # Wait until discovery has run (give poly_poll_task 8s head-start)
+    await asyncio.sleep(8)
+
+    # Collect all YES + NO token_ids for subscription
+    token_ids: list[str] = []
+    for ids in state.market_token_ids.values():
+        token_ids.extend(ids)
+
+    if not token_ids:
+        log.warning("[poly-ws] no token_ids — WS task idle (discovery may not have run yet)")
+        # Wait a bit more then retry once
+        await asyncio.sleep(10)
+        for ids in state.market_token_ids.values():
+            token_ids.extend(ids)
+        if not token_ids:
+            log.warning("[poly-ws] still no tokens, WS disabled for this run")
+            return
+
+    log.info("[poly-ws] subscribing to %d tokens", len(token_ids))
+    await polymarket_ws_task(token_ids, _on_event, state.shutdown, ssl_ctx=_SSL)
+
 
 async def signal_detector_task() -> None:
     """Every 1s: check for CEX jumps, open new lag events, retire completed ones."""
@@ -828,7 +900,12 @@ def generate_report(events: list[LagEvent], elapsed_s: float) -> str:
     a("")
     a(f"> Generated: {ts}")
     a(f"> Duration: {elapsed_s/3600:.2f}h  |  Total events: {n}")
-    a(f"> Poly poll interval: {POLY_POLL_S}s  |  CEX consensus required: {CONSENSUS_NEEDED}/3")
+    poly_src_label = {
+        "http": f"HTTP polling ({POLY_POLL_S}s interval — 2s quantization floor)",
+        "ws":   "WebSocket (sub-second, no quantization)",
+        "both": f"HTTP + WebSocket (WS primary, HTTP fallback)",
+    }.get(state.poly_source, state.poly_source)
+    a(f"> Poly source: **{poly_src_label}**  |  CEX consensus required: {CONSENSUS_NEEDED}/3")
     a(f"> Move threshold: {MOVE_THRESHOLD_PCT*100:.1f}% in {MOVE_WINDOW_S:.0f}s")
     a(f"> Fee model: {TAKER_FEE_RATE*100:.0f}% taker + {SLIPPAGE_PCT*100:.1f}% slippage")
     a("")
@@ -844,8 +921,16 @@ def generate_report(events: list[LagEvent], elapsed_s: float) -> str:
     # Lag distribution
     a("## 1. Observed Lag Distribution")
     a("")
-    a("*Quantization note: Polymarket is polled every 2s via HTTP. "
-      "True lag may be lower than measured. All figures are lower bounds.*")
+    if state.poly_source == "http":
+        a("*⚠️ HTTP source: Polymarket polled every 2s. "
+          "True lag may be lower than measured. All figures are lower bounds. "
+          "Use `--poly-source ws` for sub-second precision.*")
+    elif state.poly_source == "ws":
+        a("*✅ WebSocket source: sub-second Polymarket timestamps. "
+          "Lag figures reflect true repricing latency with no HTTP quantization.*")
+    else:
+        a("*WebSocket + HTTP sources combined. WS events provide sub-second precision; "
+          "HTTP fills gaps during WS reconnects.*")
     a("")
     a(f"| Metric | Value |")
     a(f"|--------|-------|")
@@ -900,7 +985,9 @@ def generate_report(events: list[LagEvent], elapsed_s: float) -> str:
     a(f"| OKX ticks | {state.okx_ticks:,} |")
     a(f"| Binance ticks | {state.binance_ticks:,} |")
     a(f"| Bybit ticks | {state.bybit_ticks:,} |")
-    a(f"| Polymarket polls | {state.poly_polls:,} |")
+    a(f"| Polymarket HTTP polls | {state.poly_polls:,} |")
+    a(f"| Polymarket WS events | {state.poly_ws_events:,} |")
+    a(f"| Poly data source | {state.poly_source} |")
     a(f"| Errors | {state.errors} |")
     a("")
 
@@ -943,14 +1030,20 @@ def generate_report(events: list[LagEvent], elapsed_s: float) -> str:
 # Main runner
 # ---------------------------------------------------------------------------
 
-async def run(duration_s: float, once: bool) -> list[LagEvent]:
+async def run(duration_s: float, once: bool, poly_source: str = "http") -> list[LagEvent]:
+    state.poly_source = poly_source
+
     tasks = [
-        asyncio.create_task(okx_feed_task(),       name="okx"),
-        asyncio.create_task(_binance_live_task(),  name="binance"),
-        asyncio.create_task(_bybit_live_task(),    name="bybit"),
-        asyncio.create_task(poly_poll_task(),      name="poly"),
+        asyncio.create_task(okx_feed_task(),        name="okx"),
+        asyncio.create_task(_binance_live_task(),   name="binance"),
+        asyncio.create_task(_bybit_live_task(),     name="bybit"),
         asyncio.create_task(signal_detector_task(), name="detector"),
     ]
+    # Polymarket data source selection
+    if poly_source in ("http", "both"):
+        tasks.append(asyncio.create_task(poly_poll_task(), name="poly_http"))
+    if poly_source in ("ws", "both"):
+        tasks.append(asyncio.create_task(poly_ws_task(), name="poly_ws"))
 
     if once:
         # In --once mode: wait for Poly discovery, collect for 120s, then exit
@@ -983,9 +1076,21 @@ async def run(duration_s: float, once: bool) -> list[LagEvent]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Latency edge verifier (read-only)")
-    parser.add_argument("--duration", type=float, default=3600, help="Run duration seconds (default 3600)")
-    parser.add_argument("--once",  action="store_true", help="Quick 120s test run")
-    parser.add_argument("--report", type=Path, default=OUTPUT_REPORT)
+    parser.add_argument("--duration",    type=float, default=3600)
+    parser.add_argument("--once",        action="store_true", help="Quick 120s test run")
+    parser.add_argument("--report",      type=Path,  default=OUTPUT_REPORT)
+    parser.add_argument(
+        "--poly-source",
+        choices=["http", "ws", "both"],
+        default="http",
+        dest="poly_source",
+        help=(
+            "Polymarket data source: "
+            "http = 2s polling (default, no quantization fix); "
+            "ws = CLOB market WebSocket (sub-second, precise); "
+            "both = WS primary + HTTP fallback"
+        ),
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -994,7 +1099,11 @@ def main() -> None:
         handlers=[logging.StreamHandler(), logging.FileHandler(LOG_FILE)],
     )
 
-    events = asyncio.run(run(duration_s=args.duration, once=args.once))
+    events = asyncio.run(run(
+        duration_s=args.duration,
+        once=args.once,
+        poly_source=args.poly_source,
+    ))
     elapsed = time.monotonic() - state.start_ts
     report = generate_report(events, elapsed)
 
