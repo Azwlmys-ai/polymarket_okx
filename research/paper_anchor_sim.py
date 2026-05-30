@@ -2,7 +2,7 @@
 paper_anchor_sim.py — real-time paper execution validator.
 
 Strategy:
-  anchor_est = Binance_T_open - ANCHOR_CORRECTION
+  anchor_est = Binance_T_open - rolling_mean(Binance_T_open - priceToBeat, window=100)
   If abs(BTC_live - anchor_est) > SIGNAL_THRESHOLD at T+90s/T+120s/T+180s:
     → paper signal, direction = UP if BTC_live > anchor_est else DOWN
 
@@ -27,7 +27,8 @@ import signal
 import ssl
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from collections import deque
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean, median, stdev
@@ -39,7 +40,12 @@ import aiohttp
 # Config
 # ---------------------------------------------------------------------------
 
-ANCHOR_CORRECTION = 76.75          # Binance T_open - Chainlink priceToBeat (measured)
+ANCHOR_CORRECTION_STATIC = 88.70   # static fallback before enough live samples
+ANCHOR_CORRECTION_WINDOW = 100     # rolling window size (number of resolved windows)
+ANCHOR_CORRECTION_MIN_SAMPLES = 20 # switch to rolling once this many samples accumulated
+
+# Rolling epoch start: first window that used dynamic rolling correction (2026-05-23 ~13:00 UTC)
+ROLLING_EPOCH_START_TS = 1779541200
 SIGNAL_THRESHOLD_USD = 40.0        # min |BTC_live - anchor_est| to trigger paper signal
 CHECK_OFFSETS_S = [90, 120, 180]   # seconds into window to record checkpoints
 WINDOW_S = 300                     # 5 minutes
@@ -52,11 +58,53 @@ BINANCE_BASE = "https://api.binance.com"
 SLUG_PREFIX = "btc-updown-5m-"
 
 SIGNALS_PATH = Path("research/paper_anchor_signals.jsonl")
+SIGNAL_EVENTS_PATH = Path("research/paper_anchor_signal_events.jsonl")
 REPORT_PATH = Path("research/paper_anchor_report.md")
+
+REPORT_DISTANCE_THRESHOLDS = [40, 60, 80, 100, 110, 120, 130, 150, 200]
+REPORT_LIVE_THRESHOLDS = [100, 110, 120, 130, 150]
+REPORT_EXPIRY_THRESHOLDS = [100, 120, 130, 150]
+REPORT_RISK_THRESHOLDS = [120, 130, 150]
+REPORT_DISTANCE_BUCKETS = [
+    (40, 60, "40-60"),
+    (60, 80, "60-80"),
+    (80, 100, "80-100"),
+    (100, 120, "100-120"),
+    (120, 150, "120-150"),
+    (150, 200, "150-200"),
+    (200, None, ">=200"),
+]
+REPORT_REMAINING_TIME_BUCKETS = [
+    (None, 1, "<1h"),
+    (1, 6, "1h-6h"),
+    (6, 12, "6h-12h"),
+    (12, 24, "12h-24h"),
+    (24, 48, "24h-48h"),
+    (48, 72, "48h-72h"),
+    (72, None, ">72h"),
+]
 
 # Resolution polling
 RESOLUTION_POLL_INTERVAL_S = 10
 RESOLUTION_TIMEOUT_S = 900        # give up after 15 minutes past endDate (API cache lag observed up to 8min)
+
+# ---------------------------------------------------------------------------
+# Rolling anchor correction
+# ---------------------------------------------------------------------------
+
+_anchor_deltas: deque[float] = deque(maxlen=ANCHOR_CORRECTION_WINDOW)
+
+
+def _get_anchor_correction() -> float:
+    """Rolling mean of (Binance_T_open − priceToBeat); static fallback until enough samples."""
+    if len(_anchor_deltas) >= ANCHOR_CORRECTION_MIN_SAMPLES:
+        return mean(_anchor_deltas)
+    return ANCHOR_CORRECTION_STATIC
+
+
+def _update_anchor_delta(t_open: float, price_to_beat: float) -> None:
+    _anchor_deltas.append(t_open - price_to_beat)
+
 
 # ---------------------------------------------------------------------------
 # SSL / HTTP
@@ -121,8 +169,24 @@ class WindowRecord:
 
     @classmethod
     def from_dict(cls, d: dict) -> "WindowRecord":
-        r = cls(**{k: v for k, v in d.items() if k != "checkpoints"})
-        r.checkpoints = [Checkpoint(**c) for c in d.get("checkpoints", [])]
+        record_fields = {f.name for f in fields(cls)}
+        checkpoint_fields = {f.name for f in fields(Checkpoint)}
+        required_checkpoint_defaults = {
+            "offset_s": 0,
+            "ts_utc": "",
+            "btc_live": 0.0,
+            "distance": 0.0,
+            "direction": "NONE",
+            "triggered": False,
+        }
+        r = cls(**{k: v for k, v in d.items() if k in record_fields and k != "checkpoints"})
+        checkpoints = []
+        for raw in d.get("checkpoints", []):
+            c = {k: v for k, v in raw.items() if k in checkpoint_fields}
+            for k, v in required_checkpoint_defaults.items():
+                c.setdefault(k, v)
+            checkpoints.append(Checkpoint(**c))
+        r.checkpoints = checkpoints
         return r
 
     def triggered_checkpoints(self) -> list[Checkpoint]:
@@ -283,8 +347,9 @@ async def window_worker(
         await _log(f"T_open fetch FAILED: {rec.t_open_error}")
     else:
         rec.binance_t_open = t_open
-        rec.anchor_est = round(t_open - ANCHOR_CORRECTION, 2)
-        await _log(f"T_open={t_open:.2f}  anchor_est={rec.anchor_est:.2f}")
+        correction = _get_anchor_correction()
+        rec.anchor_est = round(t_open - correction, 2)
+        await _log(f"T_open={t_open:.2f}  correction={correction:.2f}  anchor_est={rec.anchor_est:.2f}")
 
     # --- Step 2: Checkpoints at T+90, T+120, T+180 ---
     for offset in CHECK_OFFSETS_S:
@@ -355,6 +420,33 @@ async def window_worker(
             f"T+{offset}s  BTC={btc:.2f}  dist={distance:+.2f}  "
             f"poly={bid}/{ask}  {signal_str}"
         )
+        if triggered:
+            try:
+                _append_signal_event(
+                    {
+                        "event_type": "signal_started",
+                        "ts": ts_utc,
+                        "slug": slug,
+                        "asset": "BTC",
+                        "direction": direction,
+                        "dist": round(distance, 2),
+                        "threshold": SIGNAL_THRESHOLD_USD,
+                        "checkpoint": f"T+{offset}",
+                        "checkpoint_offset_s": offset,
+                        "event_start_ts": event_start_ts,
+                        "market_end_ts": rec.end_ts,
+                        "poly_bid": bid,
+                        "poly_ask": ask,
+                        "poly_price": ask if direction == "UP" else (1.0 - bid if bid is not None else None),
+                        "poly_spread": spread,
+                        "poly_liquidity": liquidity,
+                        "anchor_price": rec.anchor_est,
+                        "btc_live": btc,
+                        "candidate_id": f"{slug}:T+{offset}:{direction}",
+                    }
+                )
+            except Exception as exc:
+                await _log(f"WARNING signal event write failed: {exc}")
 
     # --- Step 3: Wait for endDate, then poll resolution ---
     end_ts = event_start_ts + WINDOW_S
@@ -370,6 +462,8 @@ async def window_worker(
             rec.price_to_beat = res["price_to_beat"]
             rec.final_price = res["final_price"]
             rec.resolved_ts = int(time.time())
+            if rec.binance_t_open and rec.price_to_beat:
+                _update_anchor_delta(rec.binance_t_open, rec.price_to_beat)
             break
         await asyncio.sleep(RESOLUTION_POLL_INTERVAL_S)
 
@@ -412,6 +506,12 @@ def _append_jsonl(rec: WindowRecord) -> None:
         f.write(json.dumps(rec.to_dict()) + "\n")
 
 
+def _append_signal_event(event: dict[str, Any]) -> None:
+    SIGNAL_EVENTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SIGNAL_EVENTS_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(event) + "\n")
+
+
 def _load_jsonl() -> list[WindowRecord]:
     if not SIGNALS_PATH.exists():
         return []
@@ -443,6 +543,14 @@ async def run_simulation() -> None:
     async with aiohttp.ClientSession(connector=connector) as session:
         existing = _load_jsonl()
         seen_slugs = {r.slug for r in existing}
+
+        # Seed rolling anchor correction from historical resolved records
+        for r in existing:
+            if r.binance_t_open and r.price_to_beat:
+                _update_anchor_delta(r.binance_t_open, r.price_to_beat)
+        if _anchor_deltas:
+            print(f"[init] Rolling anchor correction seeded: N={len(_anchor_deltas)}, "
+                  f"mean={mean(_anchor_deltas):.2f} (using {'rolling' if len(_anchor_deltas)>=ANCHOR_CORRECTION_MIN_SAMPLES else 'static'})")
 
         # Handle current window (may have started up to 180s ago — still useful)
         now = int(time.time())
@@ -506,7 +614,196 @@ def _fmt(v: float, fmt: str = ".4f") -> str:
     return f"{v:{fmt}}" if not (math.isnan(v) if isinstance(v, float) else False) else "N/A"
 
 
+def _fmt_signed(v: float | None, digits: int = 4) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "N/A"
+    return f"{v:+.{digits}f}"
+
+
+def _fmt_plain(v: float | None, digits: int = 4) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "N/A"
+    return f"{v:.{digits}f}"
+
+
+def _max_drawdown(pnls: list[float]) -> float | None:
+    """Max drop from a prior peak on the running cumulative fee-adjusted PnL curve."""
+    if not pnls:
+        return None
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for pnl in pnls:
+        equity += pnl
+        peak = max(peak, equity)
+        max_dd = max(max_dd, peak - equity)
+    return max_dd
+
+
+def _profit_factor(pnls: list[float]) -> float | None:
+    if not pnls:
+        return None
+    gross_win = sum(p for p in pnls if p > 0)
+    gross_loss = abs(sum(p for p in pnls if p < 0))
+    if gross_loss == 0:
+        return float("inf") if gross_win > 0 else None
+    return gross_win / gross_loss
+
+
+def _recovery_factor(cumulative_pnl: float | None, max_drawdown: float | None) -> float | None:
+    if cumulative_pnl is None or max_drawdown is None or max_drawdown == 0:
+        return None
+    return cumulative_pnl / max_drawdown
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) < 2 or len(xs) != len(ys):
+        return None
+    x_mean = mean(xs)
+    y_mean = mean(ys)
+    x_var = sum((x - x_mean) ** 2 for x in xs)
+    y_var = sum((y - y_mean) ** 2 for y in ys)
+    if x_var == 0 or y_var == 0:
+        return None
+    cov = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    return cov / math.sqrt(x_var * y_var)
+
+
+def _percentile(values: list[float], q: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    ordered = sorted(values)
+    pos = (len(ordered) - 1) * q
+    lo = math.floor(pos)
+    hi = math.ceil(pos)
+    if lo == hi:
+        return ordered[lo]
+    weight = pos - lo
+    return ordered[lo] * (1 - weight) + ordered[hi] * weight
+
+
+def _checkpoint_epoch(r: WindowRecord, cp: Checkpoint) -> int | None:
+    if cp.ts_utc:
+        try:
+            return int(datetime.fromisoformat(cp.ts_utc.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            pass
+    if r.event_start_ts and cp.offset_s is not None:
+        return r.event_start_ts + cp.offset_s
+    return None
+
+
+def _hold_hours(r: WindowRecord, cp: Checkpoint) -> float | None:
+    start_ts = _checkpoint_epoch(r, cp)
+    end_ts = r.resolved_ts or r.end_ts
+    if start_ts is None or not end_ts or end_ts < start_ts:
+        return None
+    return (end_ts - start_ts) / 3600
+
+
+def _remaining_hours(r: WindowRecord, cp: Checkpoint) -> float | None:
+    entry_ts = _checkpoint_epoch(r, cp)
+    if entry_ts is None or not r.end_ts or r.end_ts < entry_ts:
+        return None
+    return (r.end_ts - entry_ts) / 3600
+
+
+def _bucket_contains(value: float, lo: float | None, hi: float | None) -> bool:
+    if lo is not None and value < lo:
+        return False
+    if hi is not None and value >= hi:
+        return False
+    return True
+
+
+def _pnl_rows(pairs: list[tuple[WindowRecord, Checkpoint]]) -> list[tuple[WindowRecord, Checkpoint, float]]:
+    rows = []
+    for r, cp in pairs:
+        pnl = r.paper_pnl(cp)
+        if pnl is not None:
+            rows.append((r, cp, pnl))
+    return rows
+
+
+def _stats_for_rows(rows: list[tuple[WindowRecord, Checkpoint, float]]) -> dict[str, float | int | None]:
+    pnls = [pnl for _, _, pnl in rows]
+    wins = sum(1 for r, cp, _ in rows if cp.direction == r.outcome)
+    win_pnls = [p for p in pnls if p > 0]
+    loss_pnls = [p for p in pnls if p < 0]
+    holds = [h for r, cp, _ in rows for h in [_hold_hours(r, cp)] if h is not None]
+    hold_corr_rows = [(h, pnl) for r, cp, pnl in rows for h in [_hold_hours(r, cp)] if h is not None]
+    return {
+        "n": len(rows),
+        "wins": wins,
+        "win_rate": wins / len(rows) if rows else None,
+        "mean": mean(pnls) if pnls else None,
+        "median": median(pnls) if pnls else None,
+        "sum": sum(pnls) if pnls else None,
+        "avg_win": mean(win_pnls) if win_pnls else None,
+        "avg_loss": mean(loss_pnls) if loss_pnls else None,
+        "profit_factor": _profit_factor(pnls),
+        "max_drawdown": _max_drawdown(pnls),
+        "recovery_factor": _recovery_factor(sum(pnls) if pnls else None, _max_drawdown(pnls)),
+        "best": max(pnls) if pnls else None,
+        "worst": min(pnls) if pnls else None,
+        "p25": _percentile(pnls, 0.25),
+        "p50": _percentile(pnls, 0.50),
+        "p75": _percentile(pnls, 0.75),
+        "p90": _percentile(pnls, 0.90),
+        "avg_hold_hours": mean(holds) if holds else None,
+        "median_hold_hours": median(holds) if holds else None,
+        "p25_hold_hours": _percentile(holds, 0.25),
+        "p75_hold_hours": _percentile(holds, 0.75),
+        "p90_hold_hours": _percentile(holds, 0.90),
+        "hold_lt_5m_share": sum(1 for h in holds if h < (5 / 60)) / len(holds) if holds else None,
+        "hold_5m_15m_share": sum(1 for h in holds if (5 / 60) <= h < 0.25) / len(holds) if holds else None,
+        "hold_15m_1h_share": sum(1 for h in holds if 0.25 <= h < 1) / len(holds) if holds else None,
+        "hold_gt_1h_share": sum(1 for h in holds if h >= 1) / len(holds) if holds else None,
+        "hold_gt_72h_share": sum(1 for h in holds if h > 72) / len(holds) if holds else None,
+        "hold_pnl_corr": _pearson([h for h, _ in hold_corr_rows], [p for _, p in hold_corr_rows]),
+    }
+
+
+def _fmt_ratio(v: float | None) -> str:
+    if v is None:
+        return "N/A"
+    if math.isinf(v):
+        return "inf"
+    return f"{v:.2f}"
+
+
+def _fmt_percent(v: float | None) -> str:
+    if v is None:
+        return "N/A"
+    return f"{v:.1%}"
+
+
+def _raw_jsonl_rows() -> list[dict[str, Any]]:
+    if not SIGNALS_PATH.exists():
+        return []
+    rows = []
+    for line in SIGNALS_PATH.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def _raw_has_any(raw_rows: list[dict[str, Any]], keys: tuple[str, ...]) -> bool:
+    return any(any(k in row and row[k] is not None for k in keys) for row in raw_rows)
+
+
+def _fmt_field_status(available: bool, source: str) -> str:
+    return f"available ({source})" if available else "N/A"
+
+
 def generate_report() -> None:
+    raw_rows = _raw_jsonl_rows()
     records = _load_jsonl()
     resolved = [r for r in records if r.resolved]
     all_triggered = [
@@ -521,16 +818,31 @@ def generate_report() -> None:
         per_offset.setdefault(cp.offset_s, []).append((r, cp))
 
     # All PnLs
-    all_pnls = [p for r, cp in all_triggered for p in [r.paper_pnl(cp)] if p is not None]
-    wins = sum(1 for r, cp in all_triggered if cp.direction == r.outcome)
+    all_rows = _pnl_rows(all_triggered)
+    all_pnls = [pnl for _, _, pnl in all_rows]
+    wins = sum(1 for r, cp, _ in all_rows if cp.direction == r.outcome)
     tradeable_signals = [(r, cp) for r, cp in all_triggered if cp.tradeable]
 
     n_windows = len(resolved)
-    n_triggered = len(all_triggered)
+    n_signal_checkpoints = len(all_triggered)
+    n_triggered = len(all_rows)
     win_rate = wins / n_triggered if n_triggered else 0
     mean_pnl = mean(all_pnls) if all_pnls else float("nan")
     med_pnl = median(all_pnls) if all_pnls else float("nan")
     std_pnl = stdev(all_pnls) if len(all_pnls) >= 2 else float("nan")
+    overall_stats = _stats_for_rows(all_rows)
+    span_days = None
+    if len(records) >= 2:
+        starts = [r.event_start_ts for r in records if r.event_start_ts]
+        if starts:
+            span_seconds = max(starts) - min(starts) + WINDOW_S
+            if span_seconds > 0:
+                span_days = span_seconds / 86400
+
+    _anchor_deltas.clear()
+    for r in resolved:
+        if r.binance_t_open and r.price_to_beat:
+            _update_anchor_delta(r.binance_t_open, r.price_to_beat)
 
     lines: list[str] = []
     a = lines.append
@@ -539,7 +851,8 @@ def generate_report() -> None:
     a("# Paper Anchor Simulation Report")
     a("")
     a(f"> Generated: {ts_now}")
-    a(f"> Strategy: anchor_est = Binance_T_open − {ANCHOR_CORRECTION}")
+    cur_correction = _get_anchor_correction()
+    a(f"> Strategy: anchor_est = Binance_T_open − rolling_mean (current={cur_correction:.2f}, N={len(_anchor_deltas)}, window={ANCHOR_CORRECTION_WINDOW})")
     a(f"> Signal threshold: ${SIGNAL_THRESHOLD_USD}")
     a(f"> Check offsets: T+{CHECK_OFFSETS_S[0]}s / T+{CHECK_OFFSETS_S[1]}s / T+{CHECK_OFFSETS_S[2]}s")
     a(f"> Fee: {TAKER_FEE_RATE*100:.0f}% taker, break-even = 53.5%")
@@ -552,12 +865,34 @@ def generate_report() -> None:
     a(f"|---|---|")
     a(f"| Total windows recorded | {len(records)} |")
     a(f"| Resolved windows | {n_windows} |")
-    a(f"| Total checkpoints with signal | {n_triggered} |")
+    a(f"| Total checkpoints with signal | {n_signal_checkpoints} |")
+    a(f"| Signals with resolvable PnL | {n_triggered} |")
     a(f"| Unique windows with ≥1 signal | {len(set(r.slug for r, _ in all_triggered))} |")
     if resolved:
         t0 = datetime.fromtimestamp(resolved[0].event_start_ts, tz=timezone.utc)
         t1 = datetime.fromtimestamp(resolved[-1].event_start_ts, tz=timezone.utc)
         a(f"| Time range | {t0:%Y-%m-%d %H:%M} → {t1:%Y-%m-%d %H:%M} UTC |")
+    a("")
+    a("### JSONL Field Coverage")
+    a("")
+    has_checkpoints = any(r.checkpoints for r in records)
+    has_title = _raw_has_any(raw_rows, ("title", "market_title", "event_title", "question"))
+    has_category = _raw_has_any(raw_rows, ("category", "market_category", "event_category"))
+    has_entry = has_checkpoints
+    has_exit = any(r.resolved_ts or r.end_ts for r in records)
+    has_close = any(r.end_ts for r in records)
+    has_dist = any(cp.distance is not None for r in records for cp in r.checkpoints)
+    has_pnl = any(r.paper_pnl(cp) is not None for r in resolved for cp in r.triggered_checkpoints())
+    a("| Field | Status |")
+    a("|-------|--------|")
+    a(f"| market slug | {_fmt_field_status(any(r.slug for r in records), 'slug')} |")
+    a(f"| market title | {_fmt_field_status(has_title, 'title/market_title/event_title/question')} |")
+    a(f"| market category | {_fmt_field_status(has_category, 'category/market_category/event_category')} |")
+    a(f"| entry time | {_fmt_field_status(has_entry, 'checkpoint ts_utc or event_start_ts + offset_s')} |")
+    a(f"| exit time / hold duration | {_fmt_field_status(has_exit, 'resolved_ts or end_ts')} |")
+    a(f"| market close / expiry / end time | {_fmt_field_status(has_close, 'end_ts')} |")
+    a(f"| dist | {_fmt_field_status(has_dist, 'checkpoint distance')} |")
+    a(f"| fee-adjusted PnL | {_fmt_field_status(has_pnl, 'computed from outcome and Poly price fields')} |")
     a("")
 
     # --- Overall stats ---
@@ -566,10 +901,15 @@ def generate_report() -> None:
     a(f"| Metric | Value |")
     a(f"|--------|-------|")
     a(f"| Total triggered signals | {n_triggered} |")
+    a(f"| Resolved windows | {n_windows} |")
     a(f"| Wins (direction correct) | {wins} |")
     a(f"| Win rate | {'N/A' if not n_triggered else f'{win_rate:.1%}'} |")
     a(f"| Mean fee-adj PnL/signal | {'N/A' if math.isnan(mean_pnl) else f'{mean_pnl:+.4f}'} |")
     a(f"| Median fee-adj PnL | {'N/A' if math.isnan(med_pnl) else f'{med_pnl:+.4f}'} |")
+    a(f"| Cumulative PnL | {_fmt_signed(overall_stats['sum'])} |")
+    a(f"| Max drawdown | {_fmt_plain(overall_stats['max_drawdown'])} |")
+    a(f"| Best trade | {_fmt_signed(overall_stats['best'])} |")
+    a(f"| Worst trade | {_fmt_signed(overall_stats['worst'])} |")
     a(f"| StdDev PnL | {'N/A' if math.isnan(std_pnl) else f'{std_pnl:.4f}'} |")
     a(f"| Break-even PnL threshold | -0.0350 (fee at 0.50) |")
     a("")
@@ -603,7 +943,8 @@ def generate_report() -> None:
         a(f"| Metric | Value |")
         a(f"|--------|-------|")
         a(f"| Signals with spread data | {len(spreads)} |")
-        a(f"| Spread ≤ {TRADEABLE_SPREAD_MAX:.2f} | {spread_ok}/{len(spreads)} ({spread_ok/len(spreads):.1%} if spreads else 'N/A') |")
+        spread_pct = f"{spread_ok/len(spreads):.1%}" if spreads else "N/A"
+        a(f"| Spread ≤ {TRADEABLE_SPREAD_MAX:.2f} | {spread_ok}/{len(spreads)} ({spread_pct}) |")
         if spreads:
             a(f"| Mean spread | {mean(spreads):.3f} |")
             a(f"| Median spread | {median(spreads):.3f} |")
@@ -621,23 +962,170 @@ def generate_report() -> None:
         a("No signal data yet.")
     a("")
 
-    # --- Distance distribution ---
-    a("## 5. Signal Distance Distribution")
+    # --- Distance threshold performance ---
+    a("## 5. Distance Threshold Performance")
     a("")
     a("Distance = |BTC_live − anchor_est| at checkpoint time.")
     a("")
-    distances = [cp.distance for _, cp in all_triggered]
-    if distances:
-        for thresh in [40, 60, 80, 100, 150]:
-            n_above = sum(1 for d in distances if d >= thresh)
-            if n_above == 0:
+    distances = [cp.distance for _, cp in all_triggered if cp.distance is not None]
+    if all_rows:
+        a("| Threshold | N | Win Rate | Mean PnL | Median PnL | Sum PnL | Avg Win | Avg Loss | Profit Factor | Max Drawdown |")
+        a("|-----------|---|----------|----------|------------|---------|---------|----------|---------------|--------------|")
+        for thresh in REPORT_DISTANCE_THRESHOLDS:
+            rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            stats = _stats_for_rows(rows)
+            wr = "N/A" if stats["win_rate"] is None else f"{stats['win_rate']:.1%}"
+            a(
+                f"| ≥ ${thresh} | {stats['n']} | {wr} |"
+                f" {_fmt_signed(stats['mean'])} | {_fmt_signed(stats['median'])} |"
+                f" {_fmt_signed(stats['sum'])} | {_fmt_signed(stats['avg_win'])} |"
+                f" {_fmt_signed(stats['avg_loss'])} | {_fmt_ratio(stats['profit_factor'])} |"
+                f" {_fmt_plain(stats['max_drawdown'])} |"
+            )
+        a("")
+        a("Max Drawdown in this section is the largest peak-to-trough drop on the running cumulative fee-adjusted PnL curve.")
+        a("")
+
+        a("### Potential Live Threshold Simulation")
+        a("")
+        a("| Threshold | N | Signal Share | Est Signals/Day | Est Signals/Year | WR | Mean PnL | Median PnL | Sum PnL | Profit Factor | Max Drawdown | Recovery Factor |")
+        a("|-----------|---|--------------|-----------------|------------------|----|----------|------------|---------|---------------|--------------|-----------------|")
+        for thresh in REPORT_LIVE_THRESHOLDS:
+            rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            stats = _stats_for_rows(rows)
+            share = stats["n"] / n_triggered if n_triggered else None
+            est_day = stats["n"] / span_days if span_days else None
+            est_year = est_day * 365 if est_day is not None else None
+            wr = _fmt_percent(stats["win_rate"])
+            a(
+                f"| ≥ ${thresh} | {stats['n']} | {_fmt_percent(share)} |"
+                f" {_fmt_plain(est_day, 2)} | {_fmt_plain(est_year, 0)} | {wr} |"
+                f" {_fmt_signed(stats['mean'])} | {_fmt_signed(stats['median'])} |"
+                f" {_fmt_signed(stats['sum'])} | {_fmt_ratio(stats['profit_factor'])} |"
+                f" {_fmt_plain(stats['max_drawdown'])} | {_fmt_ratio(stats['recovery_factor'])} |"
+            )
+        a("")
+
+        a("### High Distance Hold Time and PnL Distribution")
+        a("")
+        a("| Threshold | Avg Hold Hours | Median Hold Hours | Hold >72h Share | PnL p25 | PnL p50 | PnL p75 | PnL p90 |")
+        a("|-----------|----------------|-------------------|-----------------|---------|---------|---------|---------|")
+        for thresh in REPORT_LIVE_THRESHOLDS:
+            rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            stats = _stats_for_rows(rows)
+            a(
+                f"| ≥ ${thresh} | {_fmt_plain(stats['avg_hold_hours'], 2)} |"
+                f" {_fmt_plain(stats['median_hold_hours'], 2)} | {_fmt_percent(stats['hold_gt_72h_share'])} |"
+                f" {_fmt_signed(stats['p25'])} | {_fmt_signed(stats['p50'])} |"
+                f" {_fmt_signed(stats['p75'])} | {_fmt_signed(stats['p90'])} |"
+            )
+        a("")
+
+        a("### Remaining Time Analysis")
+        a("")
+        a("Remaining time = market end time minus checkpoint entry time.")
+        a("")
+        for thresh in REPORT_EXPIRY_THRESHOLDS:
+            threshold_rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            remaining_rows = [
+                (r, cp, pnl, rem)
+                for r, cp, pnl in threshold_rows
+                for rem in [_remaining_hours(r, cp)]
+                if rem is not None
+            ]
+            a(f"#### dist ≥ ${thresh}")
+            a("")
+            if not remaining_rows:
+                a("N/A")
+                a("")
                 continue
-            subset = [(r, cp) for r, cp in all_triggered if cp.distance >= thresh]
-            sw = sum(1 for r, cp in subset if cp.direction == r.outcome)
-            spnls = [p for r, cp in subset for p in [r.paper_pnl(cp)] if p is not None]
-            a(f"**Distance ≥ ${thresh}** (N={n_above}, {n_above/len(all_triggered):.0%} of signals):"
-              f" win rate = {sw/n_above:.1%},"
-              f" mean PnL = {mean(spnls):+.4f}")
+            a("| Remaining Time | N | Share | WR | Mean PnL | Median PnL | Profit Factor | Max Drawdown |")
+            a("|----------------|---|-------|----|----------|------------|---------------|--------------|")
+            for lo, hi, label in REPORT_REMAINING_TIME_BUCKETS:
+                bucket_rows = [
+                    (r, cp, pnl)
+                    for r, cp, pnl, rem in remaining_rows
+                    if _bucket_contains(rem, lo, hi)
+                ]
+                stats = _stats_for_rows(bucket_rows)
+                share = stats["n"] / len(remaining_rows) if remaining_rows else None
+                a(
+                    f"| {label} | {stats['n']} | {_fmt_percent(share)} | {_fmt_percent(stats['win_rate'])} |"
+                    f" {_fmt_signed(stats['mean'])} | {_fmt_signed(stats['median'])} |"
+                    f" {_fmt_ratio(stats['profit_factor'])} | {_fmt_plain(stats['max_drawdown'])} |"
+                )
+            a("")
+
+        a("### Hold Duration Analysis")
+        a("")
+        a("| Threshold | Avg Hours | Median Hours | p25 Hours | p75 Hours | p90 Hours | Hold <5m | Hold 5m-15m | Hold 15m-1h | Hold >1h | PnL/Hold Pearson r |")
+        a("|-----------|-----------|--------------|-----------|-----------|-----------|----------|-------------|-------------|----------|--------------------|")
+        for thresh in REPORT_EXPIRY_THRESHOLDS:
+            rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            stats = _stats_for_rows(rows)
+            a(
+                f"| ≥ ${thresh} | {_fmt_plain(stats['avg_hold_hours'], 2)} |"
+                f" {_fmt_plain(stats['median_hold_hours'], 2)} | {_fmt_plain(stats['p25_hold_hours'], 2)} |"
+                f" {_fmt_plain(stats['p75_hold_hours'], 2)} | {_fmt_plain(stats['p90_hold_hours'], 2)} |"
+                f" {_fmt_percent(stats['hold_lt_5m_share'])} | {_fmt_percent(stats['hold_5m_15m_share'])} |"
+                f" {_fmt_percent(stats['hold_15m_1h_share'])} | {_fmt_percent(stats['hold_gt_1h_share'])} |"
+                f" {_fmt_plain(stats['hold_pnl_corr'])} |"
+            )
+        a("")
+
+        a("### Near-expiry Risk Summary")
+        a("")
+        a("| Threshold | Remaining <6h Share | Remaining <24h Share | Risk Note |")
+        a("|-----------|----------------------|-----------------------|-----------|")
+        for thresh in REPORT_RISK_THRESHOLDS:
+            threshold_rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= thresh]
+            remaining = [rem for r, cp, _ in threshold_rows for rem in [_remaining_hours(r, cp)] if rem is not None]
+            lt_6h = sum(1 for rem in remaining if rem < 6) / len(remaining) if remaining else None
+            lt_24h = sum(1 for rem in remaining if rem < 24) / len(remaining) if remaining else None
+            notes = []
+            if lt_6h is not None and lt_6h > 0.70:
+                notes.append("WARNING: edge may be near-expiry dominated")
+            if lt_24h is not None and lt_24h > 0.70:
+                notes.append("CAUTION: live execution may be sensitive to latency/slippage")
+            a(f"| ≥ ${thresh} | {_fmt_percent(lt_6h)} | {_fmt_percent(lt_24h)} | {'; '.join(notes) if notes else 'OK'} |")
+        a("")
+
+        a("### Event Type / Market Group")
+        a("")
+        if has_title or has_category:
+            a("Market title/category fields are present in the JSONL, but this report currently treats BTC 5m records as one strategy group.")
+        else:
+            a("N/A - current JSONL does not include market title or category fields.")
+        a("")
+
+        corr_rows = [(cp.distance, pnl) for _, cp, pnl in all_rows if cp.distance is not None]
+        corr = _pearson([d for d, _ in corr_rows], [p for _, p in corr_rows])
+        a("### Distance/PnL Correlation")
+        a("")
+        a(f"| Metric | Value |")
+        a(f"|--------|-------|")
+        a(f"| Pearson r | {_fmt_plain(corr)} |")
+        a(f"| N | {len(corr_rows)} |")
+        a("")
+
+        a("### Distance Bucket Distribution")
+        a("")
+        a("| Bucket | N | Win Rate | Mean PnL | Median PnL | Sum PnL | Avg Win | Avg Loss | Profit Factor | Max Drawdown |")
+        a("|--------|---|----------|----------|------------|---------|---------|----------|---------------|--------------|")
+        for lo, hi, label in REPORT_DISTANCE_BUCKETS:
+            if hi is None:
+                rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and cp.distance >= lo]
+            else:
+                rows = [(r, cp, pnl) for r, cp, pnl in all_rows if cp.distance is not None and lo <= cp.distance < hi]
+            stats = _stats_for_rows(rows)
+            wr = "N/A" if stats["win_rate"] is None else f"{stats['win_rate']:.1%}"
+            a(
+                f"| {label} | {stats['n']} | {wr} |"
+                f" {_fmt_signed(stats['mean'])} | {_fmt_signed(stats['median'])} |"
+                f" {_fmt_signed(stats['sum'])} | {_fmt_signed(stats['avg_win'])} |"
+                f" {_fmt_signed(stats['avg_loss'])} | {_fmt_ratio(stats['profit_factor'])} |"
+                f" {_fmt_plain(stats['max_drawdown'])} |"
+            )
         a("")
     else:
         a("No signals yet.")
@@ -658,13 +1146,10 @@ def generate_report() -> None:
         a(f"| Mean (Binance_T_open − priceToBeat) | {mean(anchor_deltas):+.2f} USD |")
         a(f"| Median | {median(anchor_deltas):+.2f} USD |")
         a(f"| StdDev | {stdev(anchor_deltas):.2f} USD |" if len(anchor_deltas) >= 2 else "")
-        a(f"| vs calibrated correction ({ANCHOR_CORRECTION}) | diff={mean(anchor_deltas)-ANCHOR_CORRECTION:+.2f} USD |")
+        cur_corr = _get_anchor_correction()
+        a(f"| Active rolling correction | {cur_corr:.2f} USD (N={len(_anchor_deltas)}) |")
+        a(f"| All-time mean delta | {mean(anchor_deltas):+.2f} USD |")
         a("")
-        if len(anchor_deltas) >= 2 and abs(mean(anchor_deltas) - ANCHOR_CORRECTION) > 10:
-            a(f"> ⚠️  Correction drift: live mean ({mean(anchor_deltas):.2f}) differs from "
-              f"calibrated value ({ANCHOR_CORRECTION}) by "
-              f"{abs(mean(anchor_deltas)-ANCHOR_CORRECTION):.2f} USD. Consider recalibrating.")
-            a("")
     else:
         a("No anchor comparisons yet (need more resolved windows).")
         a("")
@@ -718,6 +1203,8 @@ def generate_report() -> None:
 
     a("---")
     a("*Paper simulation only. No real trades. No wallet access.*")
+    a("")
+    a("Max Drawdown is calculated from the running cumulative fee-adjusted PnL curve.")
 
     REPORT_PATH.write_text("\n".join(lines), encoding="utf-8")
     print(f"[report] Written to {REPORT_PATH}")
@@ -765,7 +1252,7 @@ def main() -> None:
 
     print("=" * 60)
     print("  Polymarket BTC 5m Paper Anchor Simulation")
-    print(f"  anchor_est = Binance_T_open − {ANCHOR_CORRECTION}")
+    print(f"  anchor_est = Binance_T_open − rolling_mean (static fallback={ANCHOR_CORRECTION_STATIC}, window={ANCHOR_CORRECTION_WINDOW})")
     print(f"  Signal threshold: ${SIGNAL_THRESHOLD_USD}")
     print(f"  Checks at: T+{CHECK_OFFSETS_S}")
     print(f"  Output: {SIGNALS_PATH}")

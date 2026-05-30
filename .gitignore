@@ -33,3 +33,6 @@ MVP_RUN_REPORT*.md
 .vscode/
 *.swp
 *.swo
+
+# SSH keys (cowork ops)
+.ssh/
